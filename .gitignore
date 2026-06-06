@@ -20,8 +20,8 @@ samsung-tv-art.env
 # Logs
 *.log
 
-# Editor
-.vscode/
+# Editor — track .vscode/tasks.json (shared); ignore settings.json (per-machine deploy vars)
+.vscode/settings.json
 
 # OS
 .DS_Store
@@ -29,6 +29,3 @@ Thumbs.db
 
 # Personal packaging materials (not part of the public repo)
 packaging/
-
-# Local VS Code settings (personal tasks, deploy configs, etc.)
-.vscode/

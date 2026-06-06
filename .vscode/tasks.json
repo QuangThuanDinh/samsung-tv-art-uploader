@@ -1,0 +1,56 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Watch All",
+			"dependsOn": [
+				"Watch & Deploy samsung-tv-art-uploader (python — restart container)",
+				"Watch & Deploy samsung-tv-art-uploader (assets — no restart)",
+				"Watch & Deploy samsung-tv-art-card"
+			],
+			"dependsOrder": "parallel",
+			"problemMatcher": [],
+			"runOptions": {
+				"runOn": "folderOpen"
+			}
+		},
+		{
+			"label": "Watch & Deploy samsung-tv-art-uploader",
+			"dependsOn": [
+				"Watch & Deploy samsung-tv-art-uploader (python — restart container)",
+				"Watch & Deploy samsung-tv-art-uploader (assets — no restart)"
+			],
+			"dependsOrder": "parallel",
+			"problemMatcher": []
+		},
+		{
+			"label": "Watch & Deploy samsung-tv-art-uploader (python — restart container)",
+			"type": "shell",
+			"command": "while true; do inotifywait -qq -e close_write,move_self uploader.py serve.py 2>/dev/null || { sleep 0.5; continue; }; while inotifywait -qq -t 2 -e close_write,move_self uploader.py serve.py 2>/dev/null; do :; done; echo \"[deploy:python] change settled, deploying…\"; rsync -av --relative -e \"ssh -p ${config:samsungTvArtUploader.deploy.sshPort}\" uploader.py serve.py ${config:samsungTvArtUploader.deploy.sshHost}:${config:samsungTvArtUploader.deploy.remotePath} && ssh -p ${config:samsungTvArtUploader.deploy.sshPort} ${config:samsungTvArtUploader.deploy.sshHost} \"/usr/local/bin/docker restart ${config:samsungTvArtUploader.deploy.container}\"; done",
+			"isBackground": true,
+			"problemMatcher": [],
+			"presentation": {
+				"group": "deploy",
+				"panel": "dedicated"
+			}
+		},
+		{
+			"label": "Watch & Deploy samsung-tv-art-uploader (assets — no restart)",
+			"type": "shell",
+			"command": "while true; do inotifywait -qq -e close_write,move_self www/index.html www/favicon.png scripts/fetch_collections.sh scripts/aggregate_csv.py 2>/dev/null || { sleep 0.5; continue; }; while inotifywait -qq -t 2 -e close_write,move_self www/index.html www/favicon.png scripts/fetch_collections.sh scripts/aggregate_csv.py 2>/dev/null; do :; done; echo \"[deploy:assets] change settled, syncing…\"; rsync -av --relative -e \"ssh -p ${config:samsungTvArtUploader.deploy.sshPort}\" www/index.html www/favicon.png scripts/fetch_collections.sh scripts/aggregate_csv.py ${config:samsungTvArtUploader.deploy.sshHost}:${config:samsungTvArtUploader.deploy.remotePath}; done",
+			"isBackground": true,
+			"problemMatcher": [],
+			"presentation": {
+				"group": "deploy",
+				"panel": "dedicated"
+			}
+		},
+		{
+			"label": "Watch & Deploy samsung-tv-art-card",
+			"type": "shell",
+			"command": "echo ha-card/samsung-tv-art-card.js ha-card/README.md | tr ' ' '\n' | entr sh -c 'rsync -av ha-card/samsung-tv-art-card.js ha-card/README.md ${config:samsungTvArtUploader.deploy.haCardPath} && rsync -av ha-card/images/ ${config:samsungTvArtUploader.deploy.haCardPath}images/'",
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

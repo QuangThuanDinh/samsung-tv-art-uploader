@@ -1,0 +1,28 @@
+// Copy this file to .vscode/settings.json and edit values for your machine.
+// .vscode/settings.json is gitignored. The watch tasks in .vscode/tasks.json
+// reference these settings via ${config:samsungTvArtUploader.deploy.*}, so
+// each clone can target its own host/paths without touching the committed file.
+{
+    "python-envs.pythonProjects": [
+        {
+            "path": ".",
+            "envManager": "ms-python.python:venv",
+            "packageManager": "ms-python.python:pip"
+        }
+    ],
+
+    // SSH host alias or user@host for the machine running the Docker container
+    "samsungTvArtUploader.deploy.sshHost": "my-nas",
+    // SSH port (use "22" if you don't run SSH on a non-standard port)
+    "samsungTvArtUploader.deploy.sshPort": "22",
+
+    // Remote directory the uploader files (uploader.py / serve.py / www/*) are rsync'd into
+    "samsungTvArtUploader.deploy.remotePath": "/path/to/samsung-tv-art-uploader/",
+
+    // Name of the docker container to restart after Python changes
+    "samsungTvArtUploader.deploy.container": "samsung-tv-art",
+
+    // Local sibling checkout of the samsung-tv-art-card repo that the
+    // ha-card watch task mirrors into. Use an ABSOLUTE path (no ~ or $HOME).
+    "samsungTvArtUploader.deploy.haCardPath": "/absolute/path/to/samsung-tv-art-card/"
+}
