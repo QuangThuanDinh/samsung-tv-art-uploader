@@ -38,5 +38,13 @@
 
     // Local sibling checkout of the samsung-tv-art-card repo that the
     // ha-card watch task mirrors into. Use an ABSOLUTE path (no ~ or $HOME).
-    "samsungTvArtUploader.deploy.haCardPath": "/absolute/path/to/samsung-tv-art-card/"
+    "samsungTvArtUploader.deploy.haCardPath": "/absolute/path/to/samsung-tv-art-card/",
+
+    // --- Optional: Sync Knowledge Base task (only used if you add a
+    //     "Knowledge Base" folder to your .code-workspace). ---
+    // Seconds between kb-sync.sh cycles (0 = run once).
+    "samsungTvArtUploader.kb.syncInterval": "180",
+    // Windows only: path to Git bash used to run the shell script.
+    // Ignored on Linux/macOS (the script runs directly).
+    "samsungTvArtUploader.kb.bashBin": "C:/Program Files/Git/bin/bash.exe"
 }

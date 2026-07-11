@@ -1,7 +1,12 @@
 {
 	"folders": [
 		{
-			"path": "."
+			"path": ".",
+			"name": "Uploader"
+		},
+		{
+			"path": "../rkkbnetwork_kb",
+			"name": "Knowledge Base"
 		}
 	],
 	"settings": {

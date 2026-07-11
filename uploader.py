@@ -605,10 +605,17 @@ class monitor_and_display:
                 try:
                     # Use a longer timeout when no token exists (first-time pairing) so the
                     # user has time to see and accept the pairing prompt on the TV.
-                    needs_pairing = not self.token_file or not os.path.exists(self.token_file)
+                    # An empty token file counts as "no token" — the TV will prompt for
+                    # approval and the handshake needs the full window, otherwise it
+                    # times out (ms.channel.timeOut) and re-prompts on every reconnect.
+                    needs_pairing = (
+                        not self.token_file
+                        or not os.path.exists(self.token_file)
+                        or os.path.getsize(self.token_file) == 0
+                    )
                     connect_timeout = 120 if needs_pairing else 15
                     if needs_pairing:
-                        self.log.info('No token file found — waiting up to %ds for TV pairing approval', connect_timeout)
+                        self.log.info('No token found — waiting up to %ds for TV pairing approval', connect_timeout)
                     await asyncio.wait_for(self.tv.start_listening(), timeout=connect_timeout)
                     self.log.info('Started')
                 except asyncio.TimeoutError:

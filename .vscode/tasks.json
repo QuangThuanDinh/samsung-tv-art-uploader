@@ -91,6 +91,32 @@
 				"group": "deploy",
 				"panel": "dedicated"
 			}
+		},
+		{
+			"label": "Sync Knowledge Base",
+			"type": "process",
+			"command": "${workspaceFolder:Knowledge Base}/bin/kb-sync.sh",
+			"windows": {
+				"command": "${config:samsungTvArtUploader.kb.bashBin}",
+				"args": [
+					"${workspaceFolder:Knowledge Base}/bin/kb-sync.sh"
+				]
+			},
+			"options": {
+				"cwd": "${workspaceFolder:Knowledge Base}",
+				"env": {
+					"RKKB_KB_SYNC_INTERVAL": "${config:samsungTvArtUploader.kb.syncInterval}"
+				}
+			},
+			"isBackground": true,
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "silent",
+				"panel": "dedicated"
+			},
+			"runOptions": {
+				"runOn": "folderOpen"
+			}
 		}
 	]
 }
