@@ -802,7 +802,11 @@ class monitor_and_display:
 
     async def ensure_standby_selected(self):
         """Upload and select standby image if present.
-        Idempotent: skips the upload when the standby is already active in this session.
+        Idempotent: skips the upload when the standby is already active in this session,
+        but first verifies the cached standby content_id still exists on the TV. The Frame
+        can drop/renumber MY_F#### ids (purge, reboot, content-id reuse), which would leave
+        a stale id that now resolves to a random leftover artwork; when that happens we clear
+        the id and re-upload a fresh standby so 'standby' always maps to standby.png.
         """
         if not self.standby:
             return
@@ -811,8 +815,16 @@ class monitor_and_display:
             self.log.warning('Standby file not found on disk: %s', standby_path)
             return
         if self.standby_content_id:
-            self.log.debug('Standby already active as %s; skipping re-upload', self.standby_content_id)
-            return
+            # Validate the cached id against the TV's live My-Collection list. Only
+            # invalidate on a definitive "present but missing" result — a None means
+            # the query failed and we must not blow away a still-valid id.
+            existing = await self.get_tv_content('MY-C0002')
+            if existing is not None and self.standby_content_id not in existing:
+                self.log.warning('Cached standby id %s is no longer on the TV — re-uploading standby', self.standby_content_id)
+                self.standby_content_id = None
+            else:
+                self.log.debug('Standby already active as %s; skipping re-upload', self.standby_content_id)
+                return
         try:
             file_data, file_type = self.read_file(standby_path)
             if file_data and self.tv.art_mode:

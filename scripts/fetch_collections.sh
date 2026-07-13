@@ -74,10 +74,32 @@ for src in $(echo "$COL_LIST" | sed 's/,/ /g'); do
 
   if [ -d "$dest/.git" ]; then
     echo "Updating collection $name from $repo"
-    (cd "$dest" && 
-       GIT_FETCH origin ${branch:+$branch} >/dev/null 2>&1 || true && 
-       if [ -n "$branch" ]; then git reset --hard origin/$branch >/dev/null 2>&1 || true; else git reset --hard FETCH_HEAD >/dev/null 2>&1 || true; fi
-    ) || echo "Warning: failed to update $name"
+    # Remove stale git lock files left behind by interrupted/crashed fetches.
+    # These silently block future fetches (fatal: Unable to create '.git/shallow.lock')
+    # and resets (cannot lock ref 'HEAD' ... refs/heads/main.lock). Because failures
+    # were previously swallowed, this caused repos to fall out of sync. Clean both the
+    # top-level locks (shallow/index/HEAD/config) and nested ref locks (refs/**/*.lock).
+    stale_locks="$(find "$dest/.git" -name '*.lock' -type f 2>/dev/null)"
+    if [ -n "$stale_locks" ]; then
+      echo "$stale_locks" | while IFS= read -r lk; do
+        [ -n "$lk" ] && echo "  Removing stale lock: ${lk#$dest/}" && rm -f "$lk" 2>/dev/null || true
+      done
+    fi
+    # Wrap the assignment in `if` so `set -e` does not abort the whole script (and
+    # skip remaining collections + prune) when a single fetch fails; the guard also
+    # captures the error message so we can surface it instead of swallowing it.
+    if fetch_err="$(cd "$dest" && GIT_FETCH origin ${branch:+$branch} 2>&1)"; then
+      :
+    else
+      echo "Warning: fetch failed for $name: $(printf '%s' "$fetch_err" | head -n1)"
+    fi
+    if [ -n "$branch" ]; then
+      (cd "$dest" && git reset --hard "origin/$branch") >/dev/null 2>&1 \
+        || echo "Warning: reset to origin/$branch failed for $name"
+    else
+      (cd "$dest" && git reset --hard FETCH_HEAD) >/dev/null 2>&1 \
+        || echo "Warning: reset to FETCH_HEAD failed for $name"
+    fi
   else
     echo "Cloning collection $name from $repo"
     # If token present and https, inject Basic creds in URL (avoid printing credentials)
