@@ -243,13 +243,26 @@ class PIL_methods:
         gets thumbnails from tv in list of content_ids
         returns dictionary of content_ids and binary data
         only used if PIL is installed
+
+        Thumbnail fetches are best-effort: some legacy Frame TVs (e.g. Art API 1.07)
+        return raw binary JPEG through a UTF-8/JSON decode path inside samsungtvws,
+        which raises UnicodeDecodeError. We skip the offending thumbnail(s) instead of
+        aborting the whole sync — otherwise the exception tears down the connection and
+        can trigger a reconnect loop after uploads exist on the TV.
         '''
         thumbnails = {}
         if content_ids:
             if self.mon.api_version == 0:
-                thumbnails = {content_id:await self.mon.tv.get_thumbnail(content_id) for content_id in content_ids}
+                for content_id in content_ids:
+                    try:
+                        thumbnails[content_id] = await self.mon.tv.get_thumbnail(content_id)
+                    except Exception as e:
+                        self.log.warning('skipping thumbnail %s — could not fetch/decode: %s', content_id, e)
             elif self.mon.api_version == 1:
-                thumbnails = {os.path.splitext(k)[0]:v for k,v in (await self.mon.tv.get_thumbnail_list(content_ids)).items()}
+                try:
+                    thumbnails = {os.path.splitext(k)[0]:v for k,v in (await self.mon.tv.get_thumbnail_list(content_ids)).items()}
+                except Exception as e:
+                    self.log.warning('failed to fetch thumbnail list (%s) — skipping thumbnail sync', e)
         self.log.info('got {} thumbnails'.format(len(thumbnails)))
         return thumbnails
         
@@ -339,6 +352,7 @@ class monitor_and_display:
         self.api_version = 0
         self.api_version_str = None        # Raw string from get_api_version(), e.g. '0.97' or '4.3.4.0'
         self.api_version_failed = False    # True when api_version request itself errors (e.g. error -9)
+        self._ws_binary_latched = False    # True once a WS-binary upload has succeeded via -1 fallback
         self._upload_compat_warned = False  # Emit old-API diagnostic at most once
         self.start = time.time()
         self.current_content_id = None
@@ -624,6 +638,12 @@ class monitor_and_display:
                     self.log.error('failed to connect with TV: {}'.format(e))
                 if self.tv.is_alive():
                     try:
+                        # Determine the Art API version before the first upload so the
+                        # standby image is sent over the correct transport. Legacy Frame
+                        # TVs (e.g. Art API 0.97/1.07) need the WS-binary path, and without
+                        # this the initial ensure_standby_selected() would fail with error -1
+                        # before the version was known.
+                        await self.get_api_version()
                         await self.check_matte()
                         await self.ensure_standby_selected()
                         await self.cleanup_old_uploads()
@@ -939,11 +959,22 @@ class monitor_and_display:
         self.log.info('SIGINT/SIGTERM received, exiting')
         os._exit(1)
         
+    # Art API versions known to require the WS-binary upload transport instead of the
+    # D2D socket path (2018/2019 Frame TVs and legacy Art API builds such as 1.07 on
+    # the UE55LS003 / 17_KANTM_UHD).
+    _WS_BINARY_API_VERSIONS = ('0.97', '1.07')
+
     async def get_api_version(self):
         '''
         checks api version to see if it's old (<2021) or new type
         sets api_version to 0 for old, and 1 for new
+
+        Idempotent: this is queried early (before the first standby upload) and again
+        from initialize(); once the version is known we skip the redundant TV request.
+        A previous failure leaves api_version_str unset so a later call can retry.
         '''
+        if self.api_version_str is not None:
+            return
         try:
             api_version = await self.tv.get_api_version()
             self.log.info('API version: {}'.format(api_version))
@@ -993,49 +1024,46 @@ class monitor_and_display:
     async def _upload_to_tv(self, file_data, file_type, matte):
         '''Route upload to the correct method based on Art API version.
 
-        Art API 0.97 (2018/2019 firmware): WS-binary frame upload.
-        All other versions: D2D socket upload via the samsungtvws library.
-
-        When api_version could not be determined (api_version_failed), try D2D first;
-        if it fails with error -1, automatically fall back to WS-binary and latch
-        api_version_str to '0.97' so subsequent uploads skip the failing D2D path.
+        Known-legacy Art API versions (_WS_BINARY_API_VERSIONS, e.g. 0.97/1.07) use the
+        WS-binary frame upload directly. Every other case tries the D2D socket upload
+        first; if the TV rejects it with error -1 — the symptom of a model that silently
+        requires WS-binary — we fall back to the binary path and latch it for the rest of
+        the session so subsequent uploads skip the failing D2D attempt. This covers both
+        TVs whose version could not be determined and TVs that report a version but still
+        need WS-binary (e.g. Art API 1.07 on UE55LS003 / 17_KANTM_UHD).
         '''
-        if self.api_version_str == '0.97':
+        if self._ws_binary_latched or self.api_version_str in self._WS_BINARY_API_VERSIONS:
             return await self._upload_ws_binary(file_data, file_type, matte)
-        if getattr(self, 'api_version_failed', False):
-            try:
-                return await self.tv.upload(file_data, file_type=file_type, matte=matte, portrait_matte=matte)
-            except Exception as e:
-                if 'error number -1' in str(e):
-                    self.log.warning(
-                        'D2D upload failed with error -1 and api_version is unknown — '
-                        'retrying with WS-binary path (2018/2019 Frame TV fallback)'
-                    )
-                    result = await self._upload_ws_binary(file_data, file_type, matte)
-                    if result:
-                        # Latch so all subsequent uploads use the binary path directly
-                        self.api_version_str = '0.97'
-                        self.log.info('WS-binary upload succeeded — latching api_version_str to 0.97 for this session')
-                    return result
+        try:
+            return await self.tv.upload(file_data, file_type=file_type, matte=matte, portrait_matte=matte)
+        except Exception as e:
+            if 'error number -1' not in str(e):
                 raise
-        return await self.tv.upload(file_data, file_type=file_type, matte=matte, portrait_matte=matte)
+            self.log.warning(
+                'D2D upload failed with error -1 — retrying with WS-binary transport '
+                '(legacy Frame TV fallback). api_version=%s',
+                self.api_version_str or 'unknown',
+            )
+            result = await self._upload_ws_binary(file_data, file_type, matte)
+            if result:
+                # Latch so all subsequent uploads use the binary path directly.
+                self._ws_binary_latched = True
+                self.log.info('WS-binary upload succeeded — latching binary transport for this session')
+            return result
 
     def _warn_upload_compat(self, error):
-        '''Emit a one-time diagnostic when uploads fail with error -1 on a TV with unknown old API.
-        Not fired when api_version_failed is set, since _upload_to_tv handles that with an
-        automatic WS-binary fallback.'''
+        '''Emit a one-time diagnostic when uploads fail with error -1.
+        _upload_to_tv already retries such failures over WS-binary, so this is a
+        best-effort hint for the case where the binary fallback also failed.'''
         if self._upload_compat_warned:
             return
         if 'error number -1' not in str(error):
             return
-        # Suppress: _upload_to_tv handles the fallback automatically in this case
-        if self.api_version_failed:
-            return
         self._upload_compat_warned = True
         self.log.warning(
-            'Upload failed with error -1 on a TV whose api_version could not be determined. '
-            'If this is a 2018/2019 Frame TV, the WS-binary upload path may not have been '
-            'selected — check that api_version returns "0.97" in the logs. '
+            'Upload failed with error -1 and the WS-binary fallback did not recover. '
+            'If this is a legacy Frame TV (2018/2019 or Art API 0.97/1.07), check the '
+            'api_version reported in the logs. '
             'See https://github.com/xchwarze/samsung-tv-ws-api/issues/130 for background.'
         )
 
