@@ -729,6 +729,17 @@ class monitor_and_display:
         try:
             self.last_artmode_check = time.time()
             in_artmode = await self.tv.in_artmode()
+            if not in_artmode:
+                # Legacy Frame TVs (e.g. 17_KANTM_UHD, Art API 1.07) omit PowerState
+                # from the REST /api/v2/ device info, so tv.on() returns False and
+                # tv.in_artmode() (= on() and get_artmode()=='on') reports False even
+                # while Art Mode is active. Fall back to an explicit get_artmode()
+                # request, which doesn't depend on PowerState, and trust 'on'.
+                try:
+                    if str(await self.tv.get_artmode()).lower() == 'on':
+                        in_artmode = True
+                except Exception as e:
+                    self.log.debug('get_artmode() fallback failed: %s', e)
             # Success - reset failure counter
             self.consecutive_failures = 0
             prev = self._in_art_mode
