@@ -724,22 +724,34 @@ class monitor_and_display:
                 self.log.warning('Reconnect attempt %d failed: %s', attempt, e)
         return False
 
+    async def _query_artmode(self):
+        """Determine Art Mode, resilient to legacy Frame TVs.
+
+        Tries tv.in_artmode() first; if it reports false OR raises, falls back to an
+        explicit get_artmode() request (with one retry). get_artmode() doesn't depend
+        on the REST PowerState field that legacy models (e.g. 17_KANTM_UHD, Art API
+        1.07) omit — those make tv.on() False and tv.in_artmode() False even in Art
+        Mode. Raises if the TV can't be queried at all, so callers can apply backoff.
+        """
+        try:
+            if await self.tv.in_artmode():
+                return True
+        except Exception as e:
+            self.log.debug('in_artmode() failed, falling back to get_artmode(): %s', e)
+        last_err = None
+        for attempt in range(2):
+            try:
+                return str(await self.tv.get_artmode()).lower() == 'on'
+            except Exception as e:
+                last_err = e
+                self.log.debug('get_artmode() attempt %d failed: %s', attempt + 1, e)
+        raise last_err if last_err else AssertionError('artmode query failed')
+
     async def safe_in_artmode(self):
         """Return True if TV reports art mode; False on any error. Uses exponential backoff."""
         try:
             self.last_artmode_check = time.time()
-            in_artmode = await self.tv.in_artmode()
-            if not in_artmode:
-                # Legacy Frame TVs (e.g. 17_KANTM_UHD, Art API 1.07) omit PowerState
-                # from the REST /api/v2/ device info, so tv.on() returns False and
-                # tv.in_artmode() (= on() and get_artmode()=='on') reports False even
-                # while Art Mode is active. Fall back to an explicit get_artmode()
-                # request, which doesn't depend on PowerState, and trust 'on'.
-                try:
-                    if str(await self.tv.get_artmode()).lower() == 'on':
-                        in_artmode = True
-                except Exception as e:
-                    self.log.debug('get_artmode() fallback failed: %s', e)
+            in_artmode = await self._query_artmode()
             # Success - reset failure counter
             self.consecutive_failures = 0
             prev = self._in_art_mode
@@ -845,6 +857,10 @@ class monitor_and_display:
         if not os.path.isfile(standby_path):
             self.log.warning('Standby file not found on disk: %s', standby_path)
             return
+        # Restore the standby id from the persistent cache so we don't re-upload a
+        # fresh standby on every restart (the id lives only in memory otherwise).
+        if not self.standby_content_id:
+            self.standby_content_id = self._load_standby_content_id()
         if self.standby_content_id:
             # Validate the cached id against the TV's live My-Collection list. Only
             # invalidate on a definitive "present but missing" result — a None means
@@ -853,6 +869,7 @@ class monitor_and_display:
             if existing is not None and self.standby_content_id not in existing:
                 self.log.warning('Cached standby id %s is no longer on the TV — re-uploading standby', self.standby_content_id)
                 self.standby_content_id = None
+                self._cache_standby_content_id(None)
             else:
                 self.log.debug('Standby already active as %s; skipping re-upload', self.standby_content_id)
                 return
@@ -868,6 +885,7 @@ class monitor_and_display:
                 content_id = await self._upload_to_tv(file_data, file_type, self.matte)
                 if content_id:
                     self.standby_content_id = content_id
+                    self._cache_standby_content_id(content_id)
                     await self.tv.select_image(content_id)
                     # Publish standby via MQTT if enabled
                     if self.mqtt_enabled:
@@ -962,7 +980,22 @@ class monitor_and_display:
             self.save_cache()
         except Exception as e:
             self.log.warning('Failed to cache selected_collections: %s', e)
-        
+
+    def _load_standby_content_id(self):
+        try:
+            self.load_cache()
+            return self.cache.get('_standby_content_id')
+        except Exception:
+            return None
+
+    def _cache_standby_content_id(self, content_id):
+        try:
+            self.load_cache()
+            self.cache['_standby_content_id'] = content_id
+            self.save_cache()
+        except Exception as e:
+            self.log.warning('Failed to cache standby content_id: %s', e)
+
     def close(self):
         '''
         exit on signal
