@@ -629,7 +629,7 @@ class monitor_and_display:
                     )
                     connect_timeout = 120 if needs_pairing else 15
                     if needs_pairing:
-                        self.log.info('No token found — waiting up to %ds for TV pairing approval', connect_timeout)
+                        self.log.info('No saved token — connecting (up to %ds); the TV may show a one-time pairing prompt', connect_timeout)
                     await asyncio.wait_for(self.tv.start_listening(), timeout=connect_timeout)
                     self.log.info('Started')
                 except asyncio.TimeoutError:
@@ -1198,7 +1198,22 @@ class monitor_and_display:
         self.load_program_data()
         self.log.info('files in directory: {}: {}'.format(self.folder, self.get_folder_files()))
         if self.sync:
-            await self.pil.initialize() #optional
+            if self.api_version_str in self._WS_BINARY_API_VERSIONS:
+                # Legacy Frame TVs (Art API 0.97/1.07) return thumbnails as a single
+                # unframed binary WebSocket packet on the main connection. The library's
+                # listen loop tries to JSON-decode it, throws, and leaves the async
+                # request/response dispatcher desynchronized — after which every request
+                # (get_artmode, etc.) times out and rotation stalls. Skip thumbnail sync
+                # entirely on these models; content IDs are tracked via the persistent
+                # cache, so the PIL reconciliation isn't needed.
+                self.log.info(
+                    'Skipping PIL thumbnail sync on legacy Art API %s — this firmware returns '
+                    'thumbnails as an unframed binary WS packet that desyncs the async dispatcher; '
+                    'content IDs are tracked via the persistent cache instead.',
+                    self.api_version_str,
+                )
+            else:
+                await self.pil.initialize() #optional
         else:
             self.log.warning('syncing disabled, not updating uploaded files list')
         
