@@ -243,13 +243,26 @@ class PIL_methods:
         gets thumbnails from tv in list of content_ids
         returns dictionary of content_ids and binary data
         only used if PIL is installed
+
+        Thumbnail fetches are best-effort: some legacy Frame TVs (e.g. Art API 1.07)
+        return raw binary JPEG through a UTF-8/JSON decode path inside samsungtvws,
+        which raises UnicodeDecodeError. We skip the offending thumbnail(s) instead of
+        aborting the whole sync — otherwise the exception tears down the connection and
+        can trigger a reconnect loop after uploads exist on the TV.
         '''
         thumbnails = {}
         if content_ids:
             if self.mon.api_version == 0:
-                thumbnails = {content_id:await self.mon.tv.get_thumbnail(content_id) for content_id in content_ids}
+                for content_id in content_ids:
+                    try:
+                        thumbnails[content_id] = await self.mon.tv.get_thumbnail(content_id)
+                    except Exception as e:
+                        self.log.warning('skipping thumbnail %s — could not fetch/decode: %s', content_id, e)
             elif self.mon.api_version == 1:
-                thumbnails = {os.path.splitext(k)[0]:v for k,v in (await self.mon.tv.get_thumbnail_list(content_ids)).items()}
+                try:
+                    thumbnails = {os.path.splitext(k)[0]:v for k,v in (await self.mon.tv.get_thumbnail_list(content_ids)).items()}
+                except Exception as e:
+                    self.log.warning('failed to fetch thumbnail list (%s) — skipping thumbnail sync', e)
         self.log.info('got {} thumbnails'.format(len(thumbnails)))
         return thumbnails
         
@@ -331,6 +344,7 @@ class monitor_and_display:
         self.exclude_content_ids = exclude_content_ids
         self.standby = standby
         self.standby_content_id = None
+        self.standby_image_date = None     # TV-assigned image_date of the standby upload; used to detect content-id reuse
         # Autosave token to file
         self.token_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), token_file) if token_file else token_file
         self.program_data_path = './uploaded_files.json'
@@ -339,6 +353,7 @@ class monitor_and_display:
         self.api_version = 0
         self.api_version_str = None        # Raw string from get_api_version(), e.g. '0.97' or '4.3.4.0'
         self.api_version_failed = False    # True when api_version request itself errors (e.g. error -9)
+        self._ws_binary_latched = False    # True once a WS-binary upload has succeeded via -1 fallback
         self._upload_compat_warned = False  # Emit old-API diagnostic at most once
         self.start = time.time()
         self.current_content_id = None
@@ -615,7 +630,7 @@ class monitor_and_display:
                     )
                     connect_timeout = 120 if needs_pairing else 15
                     if needs_pairing:
-                        self.log.info('No token found — waiting up to %ds for TV pairing approval', connect_timeout)
+                        self.log.info('No saved token — connecting (up to %ds); the TV may show a one-time pairing prompt', connect_timeout)
                     await asyncio.wait_for(self.tv.start_listening(), timeout=connect_timeout)
                     self.log.info('Started')
                 except asyncio.TimeoutError:
@@ -624,6 +639,12 @@ class monitor_and_display:
                     self.log.error('failed to connect with TV: {}'.format(e))
                 if self.tv.is_alive():
                     try:
+                        # Determine the Art API version before the first upload so the
+                        # standby image is sent over the correct transport. Legacy Frame
+                        # TVs (e.g. Art API 0.97/1.07) need the WS-binary path, and without
+                        # this the initial ensure_standby_selected() would fail with error -1
+                        # before the version was known.
+                        await self.get_api_version()
                         await self.check_matte()
                         await self.ensure_standby_selected()
                         await self.cleanup_old_uploads()
@@ -704,11 +725,34 @@ class monitor_and_display:
                 self.log.warning('Reconnect attempt %d failed: %s', attempt, e)
         return False
 
+    async def _query_artmode(self):
+        """Determine Art Mode, resilient to legacy Frame TVs.
+
+        Tries tv.in_artmode() first; if it reports false OR raises, falls back to an
+        explicit get_artmode() request (with one retry). get_artmode() doesn't depend
+        on the REST PowerState field that legacy models (e.g. 17_KANTM_UHD, Art API
+        1.07) omit — those make tv.on() False and tv.in_artmode() False even in Art
+        Mode. Raises if the TV can't be queried at all, so callers can apply backoff.
+        """
+        try:
+            if await self.tv.in_artmode():
+                return True
+        except Exception as e:
+            self.log.debug('in_artmode() failed, falling back to get_artmode(): %s', e)
+        last_err = None
+        for attempt in range(2):
+            try:
+                return str(await self.tv.get_artmode()).lower() == 'on'
+            except Exception as e:
+                last_err = e
+                self.log.debug('get_artmode() attempt %d failed: %s', attempt + 1, e)
+        raise last_err if last_err else AssertionError('artmode query failed')
+
     async def safe_in_artmode(self):
         """Return True if TV reports art mode; False on any error. Uses exponential backoff."""
         try:
             self.last_artmode_check = time.time()
-            in_artmode = await self.tv.in_artmode()
+            in_artmode = await self._query_artmode()
             # Success - reset failure counter
             self.consecutive_failures = 0
             prev = self._in_art_mode
@@ -797,6 +841,13 @@ class monitor_and_display:
                     os.remove(self.cache_path)
             except Exception as e:
                 self.log.warning('Failed to remove cache file: %s', e)
+            # The standby image is protected from deletion above, so its content id is
+            # still valid on the TV. Re-persist it after the cache wipe so standby
+            # dedup survives — otherwise the id written by ensure_standby_selected()
+            # (which runs just before cleanup) is lost and standby is re-uploaded on
+            # every restart.
+            if self.standby_content_id:
+                self._cache_standby_content_id(self.standby_content_id, self.standby_image_date)
         except Exception as e:
             self.log.warning('Failed to cleanup uploads: %s', e)
 
@@ -814,16 +865,32 @@ class monitor_and_display:
         if not os.path.isfile(standby_path):
             self.log.warning('Standby file not found on disk: %s', standby_path)
             return
+        # Restore the standby id from the persistent cache so we don't re-upload a
+        # fresh standby on every restart (the id lives only in memory otherwise).
+        if not self.standby_content_id:
+            self.standby_content_id, self.standby_image_date = self._load_standby_content_id()
         if self.standby_content_id:
-            # Validate the cached id against the TV's live My-Collection list. Only
-            # invalidate on a definitive "present but missing" result — a None means
-            # the query failed and we must not blow away a still-valid id.
-            existing = await self.get_tv_content('MY-C0002')
-            if existing is not None and self.standby_content_id not in existing:
-                self.log.warning('Cached standby id %s is no longer on the TV — re-uploading standby', self.standby_content_id)
-                self.standby_content_id = None
+            # Validate the cached id against the TV's live My-Collection list. Match on
+            # both content_id AND image_date: the Frame can free and later reuse a
+            # MY_F#### id for a different upload, so a present id alone isn't proof it's
+            # still our standby. Only invalidate on a definitive mismatch — a None list
+            # means the query failed and we must not blow away a still-valid id.
+            entries = await self.get_tv_content_entries('MY-C0002')
+            if entries is not None:
+                match = next((e for e in entries if e.get('content_id') == self.standby_content_id), None)
+                reused = bool(match and self.standby_image_date and match.get('image_date')
+                              and match.get('image_date') != self.standby_image_date)
+                if match is None or reused:
+                    reason = 'content-id reused by a different image' if reused else 'no longer on the TV'
+                    self.log.warning('Cached standby id %s is stale (%s) — re-uploading standby', self.standby_content_id, reason)
+                    self.standby_content_id = None
+                    self.standby_image_date = None
+                    self._cache_standby_content_id(None, None)
+                else:
+                    self.log.debug('Standby already active as %s; skipping re-upload', self.standby_content_id)
+                    return
             else:
-                self.log.debug('Standby already active as %s; skipping re-upload', self.standby_content_id)
+                self.log.debug('Standby id %s could not be validated (TV query failed); skipping re-upload', self.standby_content_id)
                 return
         try:
             file_data, file_type = self.read_file(standby_path)
@@ -837,6 +904,10 @@ class monitor_and_display:
                 content_id = await self._upload_to_tv(file_data, file_type, self.matte)
                 if content_id:
                     self.standby_content_id = content_id
+                    # Capture the TV-assigned image_date so a later restart can tell this
+                    # exact upload apart from a reused content_id.
+                    self.standby_image_date = await self._get_standby_image_date(content_id)
+                    self._cache_standby_content_id(content_id, self.standby_image_date)
                     await self.tv.select_image(content_id)
                     # Publish standby via MQTT if enabled
                     if self.mqtt_enabled:
@@ -931,7 +1002,23 @@ class monitor_and_display:
             self.save_cache()
         except Exception as e:
             self.log.warning('Failed to cache selected_collections: %s', e)
-        
+
+    def _load_standby_content_id(self):
+        try:
+            self.load_cache()
+            return self.cache.get('_standby_content_id'), self.cache.get('_standby_image_date')
+        except Exception:
+            return None, None
+
+    def _cache_standby_content_id(self, content_id, image_date=None):
+        try:
+            self.load_cache()
+            self.cache['_standby_content_id'] = content_id
+            self.cache['_standby_image_date'] = image_date
+            self.save_cache()
+        except Exception as e:
+            self.log.warning('Failed to cache standby content_id: %s', e)
+
     def close(self):
         '''
         exit on signal
@@ -939,11 +1026,22 @@ class monitor_and_display:
         self.log.info('SIGINT/SIGTERM received, exiting')
         os._exit(1)
         
+    # Art API versions known to require the WS-binary upload transport instead of the
+    # D2D socket path (2018/2019 Frame TVs and legacy Art API builds such as 1.07 on
+    # the UE55LS003 / 17_KANTM_UHD).
+    _WS_BINARY_API_VERSIONS = ('0.97', '1.07')
+
     async def get_api_version(self):
         '''
         checks api version to see if it's old (<2021) or new type
         sets api_version to 0 for old, and 1 for new
+
+        Idempotent: this is queried early (before the first standby upload) and again
+        from initialize(); once the version is known we skip the redundant TV request.
+        A previous failure leaves api_version_str unset so a later call can retry.
         '''
+        if self.api_version_str is not None:
+            return
         try:
             api_version = await self.tv.get_api_version()
             self.log.info('API version: {}'.format(api_version))
@@ -993,49 +1091,46 @@ class monitor_and_display:
     async def _upload_to_tv(self, file_data, file_type, matte):
         '''Route upload to the correct method based on Art API version.
 
-        Art API 0.97 (2018/2019 firmware): WS-binary frame upload.
-        All other versions: D2D socket upload via the samsungtvws library.
-
-        When api_version could not be determined (api_version_failed), try D2D first;
-        if it fails with error -1, automatically fall back to WS-binary and latch
-        api_version_str to '0.97' so subsequent uploads skip the failing D2D path.
+        Known-legacy Art API versions (_WS_BINARY_API_VERSIONS, e.g. 0.97/1.07) use the
+        WS-binary frame upload directly. Every other case tries the D2D socket upload
+        first; if the TV rejects it with error -1 — the symptom of a model that silently
+        requires WS-binary — we fall back to the binary path and latch it for the rest of
+        the session so subsequent uploads skip the failing D2D attempt. This covers both
+        TVs whose version could not be determined and TVs that report a version but still
+        need WS-binary (e.g. Art API 1.07 on UE55LS003 / 17_KANTM_UHD).
         '''
-        if self.api_version_str == '0.97':
+        if self._ws_binary_latched or self.api_version_str in self._WS_BINARY_API_VERSIONS:
             return await self._upload_ws_binary(file_data, file_type, matte)
-        if getattr(self, 'api_version_failed', False):
-            try:
-                return await self.tv.upload(file_data, file_type=file_type, matte=matte, portrait_matte=matte)
-            except Exception as e:
-                if 'error number -1' in str(e):
-                    self.log.warning(
-                        'D2D upload failed with error -1 and api_version is unknown — '
-                        'retrying with WS-binary path (2018/2019 Frame TV fallback)'
-                    )
-                    result = await self._upload_ws_binary(file_data, file_type, matte)
-                    if result:
-                        # Latch so all subsequent uploads use the binary path directly
-                        self.api_version_str = '0.97'
-                        self.log.info('WS-binary upload succeeded — latching api_version_str to 0.97 for this session')
-                    return result
+        try:
+            return await self.tv.upload(file_data, file_type=file_type, matte=matte, portrait_matte=matte)
+        except Exception as e:
+            if 'error number -1' not in str(e):
                 raise
-        return await self.tv.upload(file_data, file_type=file_type, matte=matte, portrait_matte=matte)
+            self.log.warning(
+                'D2D upload failed with error -1 — retrying with WS-binary transport '
+                '(legacy Frame TV fallback). api_version=%s',
+                self.api_version_str or 'unknown',
+            )
+            result = await self._upload_ws_binary(file_data, file_type, matte)
+            if result:
+                # Latch so all subsequent uploads use the binary path directly.
+                self._ws_binary_latched = True
+                self.log.info('WS-binary upload succeeded — latching binary transport for this session')
+            return result
 
     def _warn_upload_compat(self, error):
-        '''Emit a one-time diagnostic when uploads fail with error -1 on a TV with unknown old API.
-        Not fired when api_version_failed is set, since _upload_to_tv handles that with an
-        automatic WS-binary fallback.'''
+        '''Emit a one-time diagnostic when uploads fail with error -1.
+        _upload_to_tv already retries such failures over WS-binary, so this is a
+        best-effort hint for the case where the binary fallback also failed.'''
         if self._upload_compat_warned:
             return
         if 'error number -1' not in str(error):
             return
-        # Suppress: _upload_to_tv handles the fallback automatically in this case
-        if self.api_version_failed:
-            return
         self._upload_compat_warned = True
         self.log.warning(
-            'Upload failed with error -1 on a TV whose api_version could not be determined. '
-            'If this is a 2018/2019 Frame TV, the WS-binary upload path may not have been '
-            'selected — check that api_version returns "0.97" in the logs. '
+            'Upload failed with error -1 and the WS-binary fallback did not recover. '
+            'If this is a legacy Frame TV (2018/2019 or Art API 0.97/1.07), check the '
+            'api_version reported in the logs. '
             'See https://github.com/xchwarze/samsung-tv-ws-api/issues/130 for background.'
         )
 
@@ -1126,7 +1221,22 @@ class monitor_and_display:
         self.load_program_data()
         self.log.info('files in directory: {}: {}'.format(self.folder, self.get_folder_files()))
         if self.sync:
-            await self.pil.initialize() #optional
+            if self.api_version_str in self._WS_BINARY_API_VERSIONS:
+                # Legacy Frame TVs (Art API 0.97/1.07) return thumbnails as a single
+                # unframed binary WebSocket packet on the main connection. The library's
+                # listen loop tries to JSON-decode it, throws, and leaves the async
+                # request/response dispatcher desynchronized — after which every request
+                # (get_artmode, etc.) times out and rotation stalls. Skip thumbnail sync
+                # entirely on these models; content IDs are tracked via the persistent
+                # cache, so the PIL reconciliation isn't needed.
+                self.log.info(
+                    'Skipping PIL thumbnail sync on legacy Art API %s — this firmware returns '
+                    'thumbnails as an unframed binary WS packet that desyncs the async dispatcher; '
+                    'content IDs are tracked via the persistent cache instead.',
+                    self.api_version_str,
+                )
+            else:
+                await self.pil.initialize() #optional
         else:
             self.log.warning('syncing disabled, not updating uploaded files list')
         
@@ -1163,7 +1273,31 @@ class monitor_and_display:
             self.log.warning('failed to get contents from TV: %s', e)
             result = None
         return result
-        
+
+    async def get_tv_content_entries(self, category='MY-C0002'):
+        '''
+        Full content entries (dicts including content_id and image_date) for a category,
+        or None on failure. Used to match a stored standby id + image_date and detect
+        content-id reuse.
+        '''
+        try:
+            return list(await self.tv.available(category, timeout=10))
+        except AssertionError:
+            self.log.warning('failed to get contents from TV')
+            return None
+        except Exception as e:
+            self.log.warning('failed to get contents from TV: %s', e)
+            return None
+
+    async def _get_standby_image_date(self, content_id):
+        '''Return the TV-assigned image_date for content_id in My Photos, or None.'''
+        entries = await self.get_tv_content_entries('MY-C0002')
+        if entries:
+            match = next((e for e in entries if e.get('content_id') == content_id), None)
+            if match:
+                return match.get('image_date')
+        return None
+
     def get_folder_files(self):
         '''
         returns list of files in folder is extension matches allowed image types
