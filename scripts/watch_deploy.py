@@ -137,9 +137,9 @@ def sync_remote(args: argparse.Namespace, files: list[Path], sync_dirs: list[tup
         ok = run([*ssh_cmd(args.port), host, f"mkdir -p {mkdirs}"], args.label) and ok
     for f in files:
         rel = f.as_posix()
-        ok = run(["scp", "-P", str(args.port), str(f), f"{host}:{remote_path}/{rel}"], args.label) and ok
+        ok = run(["scp", "-O", "-P", str(args.port), str(f), f"{host}:{remote_path}/{rel}"], args.label) and ok
     for src, dest in sync_dirs:
-        ok = run(["scp", "-P", str(args.port), "-r", str(src).rstrip("/") + "/.",
+        ok = run(["scp", "-O", "-P", str(args.port), "-r", str(src).rstrip("/") + "/.",
                   f"{host}:{remote_path}/{dest}".rstrip("/")], args.label) and ok
     return ok
 
