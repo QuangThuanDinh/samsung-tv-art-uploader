@@ -4001,6 +4001,20 @@ class monitor_and_display:
         await self.initialize()
         while True:
             if not await self.safe_in_artmode():
+                # Distinguish "TV connection object is missing/dead" from a genuine
+                # "TV reachable but art mode off". The former needs a reconnect; without
+                # this the loop would spin forever calling art API methods on a None/dead
+                # connection (see issue #11: 'NoneType' object has no attribute 'get_artmode').
+                if self.tv is None or not self.tv.is_alive():
+                    self.log.warning('TV connection unavailable; attempting reconnect (failure %d)', self.consecutive_failures)
+                    self._not_in_artmode_logged = False
+                    if await self.reconnect_tv():
+                        self.log.info('TV connection restored; resuming monitoring')
+                        self.consecutive_failures = 0
+                        continue
+                    # Reconnect failed — back off (capped) before trying again.
+                    await asyncio.sleep(self.get_backoff_delay())
+                    continue
                 backoff_delay = self.artmode_refresh_seconds or 1
                 if not self._not_in_artmode_logged:
                     self.log.info('TV is not in art mode')
