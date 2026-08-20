@@ -77,7 +77,9 @@
     .title .year { font-size: .9em; color: rgba(255,255,255,.7); }
     .line { font-size: .9em; color: rgba(255,255,255,.7); line-height: 1.4; margin-top: 4px; }
     .bg { width: 100%; border-radius: 8px; background-color: #0d0c0b; overflow: hidden; border: 1px solid #3a2f2a; }
+    #bg { background: transparent; }
     .bg img { width: 100%; height: auto; display: block; border-radius: 8px; }
+    .bg img[src$="/standby.png"] { width: auto; height: 50vh; max-width: 100%; margin: 0 auto; object-fit: contain; }
     #refresh-log { margin-top: 10px; font-size: 0.85em; line-height: 1.6; max-height: 220px; overflow-y: auto; }
     /* Now Playing layout: flex column filling the full tab-content height */
     #viewNowPlaying { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -1166,10 +1168,9 @@
     function renderOptions() {
       if (!$dropdown) return;
       const setStage = new Set(staged || []);
-      const setApplied = new Set(baseline || []);
-      const sel = options.filter(o => setApplied.has(o)).sort();
-      const uns = options.filter(o => !setApplied.has(o)).sort();
-      const sorted = sel.concat(uns);
+      const sorted = options.slice().sort((a, b) =>
+        a.localeCompare(b, undefined, { sensitivity: 'base' })
+      );
       const allSelected = sorted.length > 0 && sorted.every(o => setStage.has(o));
       $dropdown.innerHTML = `
         <div class="ftv-option ftv-option-all ${allSelected ? 'selected' : ''}" data-value="__select_all__">
@@ -1530,7 +1531,11 @@
         _loadCollectionsList();
       }
       if (t.dataset.tab === 'slideshow') {
-        requestSlideshowAvailable();
+        // Keep the grid aligned with the collection picker, including staged
+        // selections that have not yet been committed to the backend.
+        slideshowCarouselOffsets = {};
+        filterAvailableForCollections(staged);
+        requestSlideshowAvailable(staged);
         // Re-seed selection if nothing is selected (happens after an auto-cycle upload
         // ran while the tab was not open, which sets slideshowPostClear=true and clears
         // slideshowSelected).  The user opening the tab is an explicit intent to see
@@ -1890,11 +1895,14 @@
     function requestSlideshowAvailable(collections) {
       if (!client) return;
       const payload = { req_id: Date.now() };
+      const requestedCollections = Array.isArray(collections)
+        ? collections
+        : (staged.length ? staged : null);
       // When previewing a staged collection set, include it so the backend scans
       // those directories instead of the committed selected_collections.
-      if (collections && collections.length) {
-        payload.collections = collections;
-        expectedAvailableCollections = collections.slice();
+      if (requestedCollections !== null) {
+        payload.collections = requestedCollections.slice();
+        expectedAvailableCollections = requestedCollections.slice();
       } else {
         expectedAvailableCollections = null;
       }
