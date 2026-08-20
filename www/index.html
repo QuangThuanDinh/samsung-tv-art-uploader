@@ -19,7 +19,6 @@
       color: #e9e4df;
     }
     .wrap {
-      max-width: 1100px;
       height: 100vh;
       margin: 0 auto;
       padding: 20px 20px 28px;
@@ -55,6 +54,7 @@
       box-sizing: border-box;
     }
     .control-card {
+      max-width: 100%;
       flex: 1 1 0;
       min-height: 0;
       display: flex;
@@ -673,7 +673,7 @@
               </div>
             </div>
             <div id="sl-uploading-warn" style="display:none; padding:6px 0 0; font-size:0.8em; color:#ffb400;">
-              &#9888; Uploading — grid locked
+              &#9888; Uploading — action buttons locked
             </div>
             <div id="sl-grid" class="sl-grid"></div>
             <div id="sl-grid-hint" class="hint" style="margin-top:6px;"></div>
@@ -772,9 +772,23 @@
     let refreshLog = [];
     let lastAttrs = null;
     let applyPending = false;
+    let pendingCollectionApply = null;
     let _applyPendingTimer = null;
     let _refreshSafetyTimer = null;
     let _updateSettingsBtnState = null;
+    function traceCollectionUi(event, details) {
+      const entry = {
+        event,
+        ts: new Date().toISOString(),
+        details: details || {},
+      };
+      console.log('[COLLECTION UI]', entry);
+      try {
+        if (client && client.connected) {
+          client.publish('frame_tv/cmd/ui/debug', JSON.stringify(entry), { qos: 0 });
+        }
+      } catch (_) {}
+    }
     function stopRefreshSpinner() {
       if ($refresh) { $refresh.classList.remove('spinning'); }
       updateButtons();
@@ -858,7 +872,7 @@
             if (!refreshInProgress) {
               refreshInProgress = true;
               refreshLog = ['Refresh request received — switching TV to standby...'];
-              const standbyUrl = `${location.origin}/app/standby.default.png`;
+              const standbyUrl = `${location.origin}/app/frame_tv_art_collections/standby.png`;
               $bg.innerHTML = `<img src="${standbyUrl}" alt="standby">`;
               if ($refresh) { $refresh.disabled = true; $refresh.classList.add('spinning'); $refresh.style.opacity = '0.7'; }
               renderRefreshLog();
@@ -924,6 +938,19 @@
           if (topic === TOPIC_SLIDESHOW_AVAIL) {
             try {
               const d = JSON.parse(payload.toString() || '{}');
+              traceCollectionUi('available_received', {
+                collections: d.collections || null,
+                expected: expectedAvailableCollections,
+                image_count: Array.isArray(d.images) ? d.images.length : 0,
+              });
+              if (expectedAvailableCollections && Array.isArray(d.collections)
+                  && !sameCollectionSelection(expectedAvailableCollections, d.collections)) {
+                traceCollectionUi('available_rejected_stale', {
+                  collections: d.collections,
+                  expected: expectedAvailableCollections,
+                });
+                return;
+              }
               slideshowAvailable = d.images || [];
               preloadThumbnails(slideshowAvailable);
               if (_availRetryTimer) { clearTimeout(_availRetryTimer); _availRetryTimer = null; }
@@ -949,6 +976,11 @@
                 }
               }
               renderSlideshowGrid();
+              traceCollectionUi('grid_rendered_from_available', {
+                image_count: slideshowAvailable.length,
+                selected_count: slideshowSelected.size,
+              });
+              updateSlideshowActionLocks();
             } catch(_) {}
           }
           if (topic.startsWith(`${TOPIC_ACK_PREFIX}/`)) {
@@ -977,12 +1009,17 @@
                     refreshInProgress = true;
                     if ($refresh) { $refresh.disabled = true; $refresh.classList.add('spinning'); $refresh.style.opacity = '0.7'; }
                     refreshLog = [];
-                    const standbyUrl = `${location.origin}/app/standby.default.png`;
+                    const standbyUrl = `${location.origin}/app/frame_tv_art_collections/standby.png`;
                     $bg.innerHTML = `<img src="${standbyUrl}" alt="standby">`;
                   }
                   refreshLog.push(msg || 'Refresh in progress...');
                   renderRefreshLog();
                 } else if (status === 'ok' || status === 'error') {
+                  if (status === 'error') {
+                    slideshowUserRefreshPending = false;
+                    slideshowClearRefreshPending = false;
+                    updateSlideshowActionLocks();
+                  }
                   const finalMsg = status === 'ok'
                     ? (msg || 'Refresh complete.')
                     : (msg ? `Refresh failed: ${msg}` : 'Refresh failed.');
@@ -1002,11 +1039,46 @@
                 const $m = document.getElementById('sl-msg');
                 if ($m) { $m.textContent = status === 'ok' ? 'Settings saved.' : `Error: ${ack.message||'unknown'}`; setTimeout(()=>{ if($m) $m.textContent=''; },5000); }
               }
+              if (cmd === 'collections/set' && (status === 'ok' || status === 'error')) {
+                traceCollectionUi('collections_set_ack', {
+                  status,
+                  message: ack.message || '',
+                  pending: pendingCollectionApply,
+                });
+                if (status === 'ok' && pendingCollectionApply) {
+                  baseline = pendingCollectionApply.slice();
+                  staged = pendingCollectionApply.slice();
+                  slideshowCarouselOffsets = {};
+                  requestSlideshowAvailable(staged);
+                  renderOptions();
+                  syncTriggerText();
+                }
+                pendingCollectionApply = null;
+                resetApplyBtn();
+                const $m = document.getElementById('sl-msg');
+                if ($m && status === 'error') {
+                  $m.textContent = `Error: ${ack.message || 'Unable to update collections'}`;
+                  setTimeout(() => { if ($m) $m.textContent = ''; }, 5000);
+                }
+              }
               if (cmd === 'slideshow/override/set') {
                 const $m = document.getElementById('sl-msg');
+                if (status === 'ok' || status === 'error') {
+                  // This flag represents only an in-flight UI request. A saved
+                  // backend override may remain pending until the TV returns,
+                  // but the gallery must stay editable while it waits.
+                  slideshowUserRefreshPending = false;
+                  if (status === 'error') slideshowClearRefreshPending = false;
+                  updateSlideshowActionLocks();
+                }
                 if ($m) {
                   if (status === 'progress') { $m.textContent = ack.message || 'Loading...'; }
-                  else { $m.textContent = status === 'ok' ? 'Override applied.' : `Error: ${ack.message||'unknown'}`; setTimeout(()=>{ if($m) $m.textContent=''; },5000); }
+                  else {
+                    $m.textContent = status === 'ok'
+                      ? (ack.message || 'Override applied.')
+                      : `Error: ${ack.message||'unknown'}`;
+                    setTimeout(()=>{ if($m) $m.textContent=''; },5000);
+                  }
                 }
               }
               if (cmd === 'slideshow/override/clear') {
@@ -1093,7 +1165,8 @@
               if (cmd === 'slideshow/preview/request') {
                 slideshowShuffling = false;
                 const $btn = document.getElementById('sl-preview-shuffle');
-                if ($btn) { $btn.disabled = false; $btn.textContent = 'Shuffle'; }
+                if ($btn) $btn.textContent = 'Shuffle';
+                updateSlideshowActionLocks();
                 if (status === 'ok' && Array.isArray(ack.paths) && ack.paths.length) {
                   slideshowPreviewMode = true;
                   slideshowSelected = new Set(ack.paths);
@@ -1109,6 +1182,7 @@
           }
           if (topic === TOPIC_SELECTED) {
             const val = (payload.toString() || '').split(',').map(s => s.trim()).filter(Boolean);
+            traceCollectionUi('selected_state_received', { collections: val });
             baseline = val;
             if (!dirty) { staged = baseline.slice(); }
             renderOptions();
@@ -1237,6 +1311,10 @@
             if (setStage.has(val)) setStage.delete(val); else setStage.add(val);
           }
           staged = Array.from(setStage);
+          traceCollectionUi('collection_staged', {
+            staged,
+            baseline,
+          });
           updateButtons();
           syncTriggerText();
           renderOptions();
@@ -1332,7 +1410,7 @@
         if (_age < 2 * 60 * 1000) {
           refreshLog = _entry.log || [];
           refreshInProgress = true;
-          if ($bg) $bg.innerHTML = `<img src="${location.origin}/app/standby.default.png" alt="standby">`;
+          if ($bg) $bg.innerHTML = `<img src="${location.origin}/app/frame_tv_art_collections/standby.png" alt="standby">`;
           renderRefreshLog();
           // Safety valve: if no new refresh ack arrives within 8s the sync is
           // already done — clear the stale state so the UI recovers automatically.
@@ -1382,7 +1460,7 @@
       const isStandbyLike = isNotInArtMode || !normalizedFile || normalizedFile === 'standby.png' || normalizedFile === 'unknown' || normalizedFile === 'unavailable' || normalizedFile === 'none';
       const isStandby = normalizedFile === 'standby.png';
       slideshowStandby = isStandbyLike;
-      updateGridLock();
+      updateSlideshowActionLocks();
       if (_updateSettingsBtnState) _updateSettingsBtnState(isNotInArtMode, isNotInArtMode);
 
       let t = '';
@@ -1431,7 +1509,7 @@
         img.onerror = () => {
           if (setInfo._gen !== gen) return;
           // Fallback to immutable baked standby image if artwork load fails
-          const standbyUrl = `${location.origin}/app/standby.default.png`;
+          const standbyUrl = `${location.origin}/app/frame_tv_art_collections/standby.png`;
           $bg.innerHTML = `<img src="${standbyUrl}" alt="standby">`;
           // Clear cache key so next MQTT message retries the artwork image
           // (e.g. after a container restart briefly causes a 404)
@@ -1440,7 +1518,7 @@
         img.src = url;
       } else if (!isNotInArtMode) {
         // No file or standby — show immutable baked standby explicitly
-        const standbyUrl = `${location.origin}/app/standby.default.png`;
+        const standbyUrl = `${location.origin}/app/frame_tv_art_collections/standby.png`;
         $bg.innerHTML = `<img src="${standbyUrl}" alt="standby">`;
       }
     }
@@ -1525,19 +1603,38 @@
     }
     if ($apply) {
       $apply.onclick = () => {
-        if (!dirty || applyPending || staged.length === 0) return;
-        client.publish(`${TOPIC_CMD_PREFIX}/collections/set`, JSON.stringify({ collections: staged, req_id: Date.now() }));
-        baseline = staged.slice();
-        // Clear the grid selection and mark a user-triggered refresh so the post-upload
-        // state handler seeds the grid from the fresh current_paths (new collection).
-        slideshowSelected = new Set();
-        slideshowPostClear = false;
-        slideshowUserRefreshPending = true;
+        if (!dirty || applyPending || staged.length === 0) {
+          traceCollectionUi('apply_ignored', {
+            dirty,
+            apply_pending: applyPending,
+            staged,
+          });
+          return;
+        }
+        const reqId = Date.now();
+        traceCollectionUi('apply_clicked', {
+          req_id: reqId,
+          staged,
+          baseline,
+          available_before: slideshowAvailable.length,
+        });
+        client.publish(
+          `${TOPIC_CMD_PREFIX}/collections/set`,
+          JSON.stringify({ collections: staged, ui_only: true, req_id: reqId }),
+          { qos: 1 }
+        );
+        pendingCollectionApply = staged.slice();
         applyPending = true;
         $apply.classList.add('apply-pending');
         _applyPendingTimer = setTimeout(resetApplyBtn, 10000);
+        filterAvailableForCollections(staged);
+        traceCollectionUi('grid_filtered_locally', {
+          req_id: reqId,
+          image_count: slideshowAvailable.length,
+          selected_count: slideshowSelected.size,
+        });
         updateButtons();
-        updateGridLock(); // lock grid immediately; stays locked until post-reseed available arrives
+        requestSlideshowAvailable(staged);
         syncTriggerText();
       };
     }
@@ -1693,7 +1790,7 @@
       refreshInProgress = true;
       refreshLog = ['Please stand by as artwork is loaded...', 'Fetching latest collection updates...'];
       renderRefreshLog();
-      const standbyUrl = `${location.origin}/app/standby.default.png`;
+      const standbyUrl = `${location.origin}/app/frame_tv_art_collections/standby.png`;
       $bg.innerHTML = `<img src="${standbyUrl}" alt="standby">`;
       $syncCollections.textContent = 'Updating\u2026';
       $syncCollections.disabled = true;
@@ -1901,12 +1998,41 @@
     const $slInterval   = document.getElementById('sl-interval');
     const $slMaxUploads = document.getElementById('sl-max-uploads');
     const $slApply      = document.getElementById('sl-settings-apply');
+    let expectedAvailableCollections = null;
+    function normalizeCollectionName(value) {
+      return String(value || '').trim().replace(/_/g, ' ').replace(/\s+/g, ' ').toLowerCase();
+    }
+    function sameCollectionSelection(left, right) {
+      const a = (left || []).map(normalizeCollectionName).sort();
+      const b = (right || []).map(normalizeCollectionName).sort();
+      return arraysEqual(a, b);
+    }
+    function filterAvailableForCollections(collections) {
+      const selected = new Set((collections || []).map(normalizeCollectionName));
+      if (!selected.size) return;
+      slideshowAvailable = slideshowAvailable.filter(img =>
+        selected.has(normalizeCollectionName(img.folder))
+        || selected.has(normalizeCollectionName(img.artist))
+      );
+      const availablePaths = new Set(slideshowAvailable.map(img => img.path));
+      slideshowSelected = new Set(
+        [...slideshowSelected].filter(path => availablePaths.has(path))
+      );
+      slideshowCarouselOffsets = {};
+      renderSlideshowGrid();
+    }
     function requestSlideshowAvailable(collections) {
       if (!client) return;
       const payload = { req_id: Date.now() };
       // When previewing a staged collection set, include it so the backend scans
       // those directories instead of the committed selected_collections.
-      if (collections && collections.length) payload.collections = collections;
+      if (collections && collections.length) {
+        payload.collections = collections;
+        expectedAvailableCollections = collections.slice();
+      } else {
+        expectedAvailableCollections = null;
+      }
+      traceCollectionUi('available_requested', payload);
       client.publish(`${TOPIC_CMD_PREFIX}/slideshow/available/request`, JSON.stringify(payload), { qos: 1 });
     }
     let _availRetryTimer = null;
@@ -2606,15 +2732,34 @@
     const $slGrid      = document.getElementById('sl-grid');
     const $slGridHint  = document.getElementById('sl-grid-hint');
 
-    // S/M/L size presets: [columns per carousel page]
-    const SL_SIZE_PRESETS = { s: 4, m: 3, l: 2 };
-    let slideshowCarouselCols = 3; // columns = items per carousel page
+    // S/M/L define a target thumbnail width. The actual page size is derived
+    // from the current grid width so wider control cards show more items.
+    const SL_THUMB_MIN_WIDTH = { s: 220, m: 300, l: 440 };
+    const SL_GRID_GAP = 10;
+    let slideshowThumbSize = 'm';
+    let slideshowCarouselCols = 3;
+    function calculateSlideshowCarouselCols() {
+      if (!$slGrid) return slideshowCarouselCols;
+      const width = $slGrid.clientWidth;
+      if (!width) return slideshowCarouselCols;
+      const minWidth = SL_THUMB_MIN_WIDTH[slideshowThumbSize] || SL_THUMB_MIN_WIDTH.m;
+      return Math.max(1, Math.floor((width + SL_GRID_GAP) / (minWidth + SL_GRID_GAP)));
+    }
+    function updateSlideshowCarouselCols() {
+      const nextCols = calculateSlideshowCarouselCols();
+      if (nextCols === slideshowCarouselCols) return false;
+      slideshowCarouselCols = nextCols;
+      $slGrid.style.setProperty('--sl-cols', slideshowCarouselCols);
+      slideshowCarouselOffsets = {};
+      return true;
+    }
     const $sizeBtns = document.querySelectorAll('.sl-size-btn');
     $sizeBtns.forEach(btn => {
       btn.addEventListener('click', () => {
         $sizeBtns.forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        slideshowCarouselCols = SL_SIZE_PRESETS[btn.dataset.size] || 6;
+        slideshowThumbSize = btn.dataset.size || 'm';
+        slideshowCarouselCols = calculateSlideshowCarouselCols();
         if ($slGrid) $slGrid.style.setProperty('--sl-cols', slideshowCarouselCols);
         // Reset offsets so page indices stay valid at the new page size
         slideshowCarouselOffsets = {};
@@ -2802,22 +2947,27 @@
         if ($slInterval && !$slInterval.dataset.dirty) $slInterval.value = slIntervalBaseline;
         if ($slMaxUploads && !$slMaxUploads.dataset.dirty) $slMaxUploads.value = slideshowMaxUploads;
         markSlSettingsDirty();
-        updateGridLock();
+        updateSlideshowActionLocks();
       } catch (_) {}
     }
 
-    function updateGridLock() {
+    function isSlideshowActionLocked() {
+      return slideshowUploading || slideshowUserRefreshPending || slideshowClearRefreshPending;
+    }
+
+    function updateSlideshowActionLocks() {
       // slideshowUserRefreshPending: user clicked Apply (collections) — reseed not yet started.
-      // Keep the grid locked from that click until the post-reseed available arrives.
-      const locked = slideshowUploading || slideshowUserRefreshPending || slideshowClearRefreshPending || (slideshowStandby && slideshowMode !== 'override');
+      // Keep actions that start backend work locked until the fresh available list arrives.
+      const locked = isSlideshowActionLocked();
       const $warn = document.getElementById('sl-uploading-warn');
       if ($warn) {
         $warn.style.display = locked ? '' : 'none';
-        $warn.textContent = slideshowUploading ? '\u26a0 Uploading \u2014 grid locked' : (slideshowUserRefreshPending || slideshowClearRefreshPending) ? '\u26a0 Applying \u2014 grid locked' : '\u26a0 Standby \u2014 grid locked';
+        $warn.textContent = slideshowUploading
+          ? '\u26a0 Uploading \u2014 action buttons locked'
+          : '\u26a0 Applying \u2014 action buttons locked';
       }
-      if ($slGrid) { $slGrid.style.pointerEvents = locked ? 'none' : ''; $slGrid.style.opacity = locked ? '0.45' : ''; }
-      if ($slOApply && locked && !slideshowPreviewMode) { $slOApply.disabled = true; $slOApply.style.opacity = 0.4; }
-      if ($slOReset && locked) $slOReset.style.display = 'none';
+      markSlSettingsDirty();
+      updateSlCounter();
       const $shuf = document.getElementById('sl-preview-shuffle');
       if ($shuf && !slideshowShuffling) {
         $shuf.disabled = locked;
@@ -2831,7 +2981,7 @@
       const mins = parseInt($slInterval.value || '0', 10);
       const maxU = parseInt($slMaxUploads ? ($slMaxUploads.value || '10') : '10', 10);
       const dirty = seq !== slSeqBaseline || mins !== slIntervalBaseline || maxU !== slMaxUploadsBaseline;
-      const canApply = dirty && !tvBlocked && !refreshInProgress;
+      const canApply = dirty && !tvBlocked && !refreshInProgress && !isSlideshowActionLocked();
       $slApply.disabled = !canApply;
       $slApply.style.opacity = canApply ? 1 : 0.6;
     }
@@ -2861,13 +3011,12 @@
       if ($slSavePreset) $slSavePreset.disabled = count === 0;
       const differs = !selectionMatchesBaseline();
       if ($slOApply) {
-        const canApply = count > 0 && !slideshowUploading && differs;
+        const canApply = count > 0 && !isSlideshowActionLocked() && differs;
         $slOApply.disabled = !canApply;
-        $slOApply.style.opacity = canApply ? 1 : (slideshowUploading ? 0.4 : 0.6);
+        $slOApply.style.opacity = canApply ? 1 : (isSlideshowActionLocked() ? 0.4 : 0.6);
       }
       if ($slOReset) {
-        const locked = slideshowUploading || slideshowUserRefreshPending || (slideshowStandby && slideshowMode !== 'override');
-        $slOReset.style.display = (locked || !differs) ? 'none' : '';
+        $slOReset.style.display = differs ? '' : 'none';
       }
       const $badge = document.getElementById('sl-mode-badge');
       if ($badge) {
@@ -2906,9 +3055,29 @@
     const CAROUSEL_PAGE = 3; // base value; at runtime slideshowCarouselCols overrides this
     let slideshowCarouselOffsets = {};
     let _carouselObserver = null;
+    let _carouselResizeFrame = null;
+    if ($slGrid && 'ResizeObserver' in window) {
+      const _carouselResizeObserver = new ResizeObserver(() => {
+        if (_carouselResizeFrame) cancelAnimationFrame(_carouselResizeFrame);
+        _carouselResizeFrame = requestAnimationFrame(() => {
+          _carouselResizeFrame = null;
+          if (updateSlideshowCarouselCols()) renderSlideshowGrid();
+        });
+      });
+      _carouselResizeObserver.observe($slGrid);
+    } else {
+      window.addEventListener('resize', () => {
+        if (_carouselResizeFrame) cancelAnimationFrame(_carouselResizeFrame);
+        _carouselResizeFrame = requestAnimationFrame(() => {
+          _carouselResizeFrame = null;
+          if (updateSlideshowCarouselCols()) renderSlideshowGrid();
+        });
+      });
+    }
 
     function renderSlideshowGrid() {
       if (!$slGrid) return;
+      slideshowCarouselCols = calculateSlideshowCarouselCols();
       const COLS = (typeof slideshowCarouselCols !== 'undefined') ? slideshowCarouselCols : CAROUSEL_PAGE;
       $slGrid.style.setProperty('--sl-cols', COLS);
       updateSlCounter();
@@ -3252,7 +3421,7 @@
 
     if ($slApply) {
       $slApply.onclick = () => {
-        if (!client) return;
+        if (!client || isSlideshowActionLocked()) return;
         const sequential = $slType.value === 'sequential';
         const update_minutes = parseInt($slInterval.value || '0', 10);
         const max_uploads = parseInt($slMaxUploads ? ($slMaxUploads.value || '10') : '10', 10);
@@ -3267,8 +3436,10 @@
 
     if ($slOApply) {
       $slOApply.onclick = () => {
-        if (!client || !slideshowSelected.size) return;
+        if (!client || !slideshowSelected.size || isSlideshowActionLocked()) return;
         const paths = Array.from(slideshowSelected);
+        slideshowUserRefreshPending = true;
+        updateSlideshowActionLocks();
         $slOApply.disabled = true;
         $slOApply._applying = true;
         $slOApply.textContent = 'Applying…';
@@ -3333,8 +3504,8 @@
         setTimeout(() => {
           if ($slShuffle.disabled) {
             slideshowShuffling = false;
-            $slShuffle.disabled = false;
             $slShuffle.textContent = 'Shuffle';
+            updateSlideshowActionLocks();
           }
         }, 20000);
       };

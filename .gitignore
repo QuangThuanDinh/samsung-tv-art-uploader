@@ -15,7 +15,10 @@ media/*
 # Secrets / local config
 .env
 samsung-tv-art.env
+pip.conf
 *.env.local
+docker-compose.yml
+scripts/docker-compose-local.ps1
 
 # Logs
 *.log

@@ -66,6 +66,7 @@ import csv
 import unicodedata
 import urllib.request
 from signal import SIGTERM, SIGINT
+from standy_util import refresh_dynamic_standby
 HAVE_PIL = False
 try:
     # Import Pillow submodules defensively. In some runtime environments a
@@ -318,6 +319,7 @@ class monitor_and_display:
         self.selection_from_mqtt = True
         self.selection_mqtt_topic = os.environ.get('SAMSUNG_TV_ART_SELECTION_MQTT_TOPIC', 'frame_tv/selected_collections/state')
         self._pending_selection_change = False
+        self._ignore_retained_selection_until_reconnect = False
         self.selection_only = os.environ.get('SAMSUNG_TV_ART_SELECTION_ONLY', '').lower() in ['1', 'true', 'yes']
         self.artmode_refresh_seconds = int(os.environ.get('SAMSUNG_TV_ART_MODE_CHECK_SECONDS', '1'))
         self.last_artmode_check = 0
@@ -338,6 +340,7 @@ class monitor_and_display:
             self.sequential = False
         # Slideshow override (persisted to /data/slideshow_override.json)
         self.slideshow_override = None  # None = auto; list[str] of path_rel = manual override
+        self.slideshow_override_pending = False
         self.slideshow_override_path = '/data/slideshow_override.json'
         self.on = on
         self.exclude = exclude
@@ -345,6 +348,10 @@ class monitor_and_display:
         self.standby = standby
         self.standby_content_id = None
         self.standby_image_date = None     # TV-assigned image_date of the standby upload; used to detect content-id reuse
+        self.dynamic_standby = os.environ.get(
+            'SAMSUNG_TV_ART_DYNAMIC_STANDBY', 'false'
+        ).lower() in ('1', 'true', 'yes')
+        self.dynamic_standby_state_path = '/data/dynamic_standby_source.json'
         # Autosave token to file
         self.token_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), token_file) if token_file else token_file
         self.program_data_path = './uploaded_files.json'
@@ -589,6 +596,7 @@ class monitor_and_display:
         self._load_slideshow_override()
         self._load_slideshow_presets()
         self._load_matte_overrides()
+        self._prepare_dynamic_standby()
         # Init MQTT if enabled
         if self.mqtt_enabled:
             self._init_mqtt()
@@ -851,7 +859,38 @@ class monitor_and_display:
         except Exception as e:
             self.log.warning('Failed to cleanup uploads: %s', e)
 
-    async def ensure_standby_selected(self):
+    def _prepare_dynamic_standby(self, preferred_paths=None):
+        """Delegate local standby generation and invalidate stale TV cache state."""
+        try:
+            standby_changed = refresh_dynamic_standby(
+                enabled=self.dynamic_standby,
+                media_root=self.media_root,
+                standby=self.standby,
+                state_path=self.dynamic_standby_state_path,
+                allowed_extensions=self.allowed_ext,
+                selected_collections=self.selected_collections,
+                cached_selected_collections=self._read_cached_selected_collections(),
+                slideshow_override=self.slideshow_override,
+                preferred_paths=preferred_paths,
+                map_collection=self._map_to_artwork_dir,
+                log=self.log,
+            )
+            if standby_changed:
+                previous_content_id = self.standby_content_id
+                self.standby_content_id = None
+                self.standby_image_date = None
+                self._cache_standby_content_id(None, None)
+                if previous_content_id:
+                    self.log.info(
+                        'Standby: source changed; invalidated cached TV content ID %s',
+                        previous_content_id,
+                    )
+        except Exception as e:
+            self.log.warning('Standby: dynamic image update failed; using existing image: %s', e)
+            return False
+        return standby_changed
+
+    async def ensure_standby_selected(self, preferred_paths=None):
         """Upload and select standby image if present.
         Idempotent: skips the upload when the standby is already active in this session,
         but first verifies the cached standby content_id still exists on the TV. The Frame
@@ -860,10 +899,16 @@ class monitor_and_display:
         the id and re-upload a fresh standby so 'standby' always maps to standby.png.
         """
         if not self.standby:
+            self.log.info('Standby: disabled; no standby path is configured')
             return
+        self.log.info(
+            'Standby: preparing image (dynamic=%s)',
+            'enabled' if self.dynamic_standby else 'disabled',
+        )
+        self._prepare_dynamic_standby(preferred_paths)
         standby_path = self.standby if os.path.isabs(self.standby) else os.path.join(self.media_root, self.standby)
         if not os.path.isfile(standby_path):
-            self.log.warning('Standby file not found on disk: %s', standby_path)
+            self.log.warning('Standby: file not found on disk: %s', standby_path)
             return
         # Restore the standby id from the persistent cache so we don't re-upload a
         # fresh standby on every restart (the id lives only in memory otherwise).
@@ -882,19 +927,21 @@ class monitor_and_display:
                               and match.get('image_date') != self.standby_image_date)
                 if match is None or reused:
                     reason = 'content-id reused by a different image' if reused else 'no longer on the TV'
-                    self.log.warning('Cached standby id %s is stale (%s) — re-uploading standby', self.standby_content_id, reason)
+                    self.log.warning('Standby: cached ID %s is stale (%s); uploading again', self.standby_content_id, reason)
                     self.standby_content_id = None
                     self.standby_image_date = None
                     self._cache_standby_content_id(None, None)
                 else:
-                    self.log.debug('Standby already active as %s; skipping re-upload', self.standby_content_id)
+                    self.log.info('Standby: already uploaded as %s; skipping upload', self.standby_content_id)
                     return
             else:
-                self.log.debug('Standby id %s could not be validated (TV query failed); skipping re-upload', self.standby_content_id)
+                self.log.info('Standby: TV validation unavailable; retaining cached ID %s', self.standby_content_id)
                 return
         try:
+            self.log.info('Standby: reading and preparing %s for TV upload', standby_path)
             file_data, file_type = self.read_file(standby_path)
             if file_data and self.tv.art_mode:
+                self.log.info('Standby: uploading image to TV')
                 # self.tv.art_mode is True here (last-known WebSocket state), so we
                 # know the TV is in art mode.  Record this immediately so the
                 # _publish_mqtt_state below carries in_art_mode: true instead of
@@ -913,10 +960,14 @@ class monitor_and_display:
                     if self.mqtt_enabled:
                         self._publish_mqtt_discovery()
                         self._publish_mqtt_state('Standby', 'standby.png', os.path.basename(os.path.dirname(standby_path)) or None)
-                    self.log.info('Selected standby: %s (%s)', self.standby, content_id)
+                    self.log.info('Standby: selected on TV as content ID %s', content_id)
+            elif not file_data:
+                self.log.warning('Standby: image preparation returned no data')
+            else:
+                self.log.info('Standby: TV is not in Art Mode; upload deferred')
         except Exception as e:
             self._warn_upload_compat(e)
-            self.log.warning('Failed to upload/select standby: %s', e)
+            self.log.warning('Standby: upload or selection failed: %s', e)
 
     def get_selected_folder(self):
         """Return selected folder based on MQTT-driven selection.
@@ -1985,8 +2036,10 @@ class monitor_and_display:
         
         if unshown:
             if self.sequential:
-                # Sequential: pick next in sorted order from unshown
-                content_id = sorted(unshown)[0]
+                # Preserve get_content_ids() order. In override mode this is the
+                # exact order selected by the user; in auto mode it remains the
+                # existing filename order.
+                content_id = unshown[0]
             else:
                 # Random: pick randomly from unshown
                 content_id = random.choice(unshown)
@@ -2287,6 +2340,14 @@ class monitor_and_display:
                     self._presets_bootstrap_timer.cancel()
                     self._presets_bootstrap_timer = None
             if self.selection_from_mqtt and topic == self.selection_mqtt_topic:
+                if (
+                    getattr(msg, 'retain', False)
+                    and self._ignore_retained_selection_until_reconnect
+                ):
+                    self.log.info(
+                        'Ignoring stale retained collection selection after explicit UI update'
+                    )
+                    return
                 payload = msg.payload.decode('utf-8') if isinstance(msg.payload, (bytes, bytearray)) else str(msg.payload or '')
                 raw_cols = [c.strip() for c in (payload or '').split(',') if c.strip()]
                 # Map retained selections to artwork_dir folder names when possible
@@ -2303,11 +2364,6 @@ class monitor_and_display:
                 if mapped != self.selected_collections:
                     self.selected_collections = mapped
                     self._pending_selection_change = True
-                    # Immediately publish the mapped selection so UI/HA reflect it
-                    try:
-                        self._publish_selected_collections_state()
-                    except Exception:
-                        pass
                     self._cache_selected_collections()
                     self.log.info('Received MQTT selection update (mapped from %s): %s', raw_cols, self.selected_collections)
                 return
@@ -2342,6 +2398,7 @@ class monitor_and_display:
             rc_val = getattr(rc, 'value', rc)
             self._mqtt_is_connected = (rc_val == 0)
             if rc_val == 0:
+                self._ignore_retained_selection_until_reconnect = False
                 self.log.info('MQTT connected (CONNACK rc=0)')
                 # Attach MQTT log handler so all INFO+ records stream to frame_tv/log
                 if not getattr(self, '_mqtt_log_handler', None):
@@ -2380,13 +2437,23 @@ class monitor_and_display:
                     t.daemon = True
                     t.start()
                     self._presets_bootstrap_timer = t
-                # Republish retained state so broker always has fresh data after reconnect
-                try:
-                    self._publish_collections_state()
-                    self._publish_settings_state()
-                    self._publish_matte_overrides()
-                except Exception:
-                    pass
+                # Republish retained state outside Paho's network callback. Several
+                # helpers wait for QoS completion, which deadlocks the callback thread
+                # and causes keepalive disconnect/reconnect loops if run inline here.
+                def republish_retained_state():
+                    try:
+                        self._publish_collections_state()
+                        self._publish_settings_state()
+                        self._publish_matte_overrides()
+                    except Exception as e:
+                        self.log.warning('Failed to republish retained MQTT state: %s', e)
+
+                worker = threading.Thread(
+                    target=republish_retained_state,
+                    name='mqtt-state-republisher',
+                    daemon=True,
+                )
+                worker.start()
                 # Reset artwork state refresh timer so the main loop immediately
                 # re-publishes the current artwork state after any (re)connect.
                 self._last_state_publish = 0
@@ -2672,17 +2739,30 @@ class monitor_and_display:
                     data = json.load(f)
                 paths = data.get('paths', [])
                 self.slideshow_override = paths if paths else None
+                self.slideshow_override_pending = bool(
+                    self.slideshow_override and data.get('pending', False)
+                )
                 if self.slideshow_override:
-                    self.log.info('Loaded slideshow override with %d paths', len(self.slideshow_override))
+                    self.log.info(
+                        'Loaded slideshow override with %d paths (pending=%s)',
+                        len(self.slideshow_override),
+                        self.slideshow_override_pending,
+                    )
         except Exception as e:
             self.log.warning('Failed to load slideshow override: %s', e)
             self.slideshow_override = None
+            self.slideshow_override_pending = False
 
     def _save_slideshow_override(self):
         """Persist slideshow override to /data/slideshow_override.json."""
         try:
             os.makedirs('/data', exist_ok=True)
-            data = {'paths': list(self.slideshow_override) if self.slideshow_override else []}
+            data = {
+                'paths': list(self.slideshow_override) if self.slideshow_override else [],
+                'pending': bool(
+                    self.slideshow_override and self.slideshow_override_pending
+                ),
+            }
             with open(self.slideshow_override_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f)
         except Exception as e:
@@ -2836,6 +2916,7 @@ class monitor_and_display:
                 'update_minutes': int(max(0, (self.update_time or 0) / 60)),
                 'max_uploads': self.max_uploads,
                 'override_paths': list(self.slideshow_override) if self.slideshow_override else [],
+                'pending': self.slideshow_override_pending,
                 'current_paths': current_paths,
                 'uploading': bool(self._refresh_in_progress or getattr(self, '_startup_in_progress', False)),
             }
@@ -2850,7 +2931,7 @@ class monitor_and_display:
         except Exception as e:
             self.log.warning('MQTT slideshow state publish failed: %s', e)
 
-    def _publish_slideshow_available(self, override_collections=None):
+    def _publish_slideshow_available(self, override_collections=None, wait_for_publish=True):
         """Scan selected collections on disk and publish full image list to MQTT.
         Pass override_collections to preview a candidate set without committing it.
         """
@@ -2906,9 +2987,15 @@ class monitor_and_display:
                 other_imgs = [img for img in images if not img['uploaded']]
                 images = uploaded_imgs + other_imgs[:max(0, 5000 - len(uploaded_imgs))]
 
-            payload = json.dumps({'images': images}, separators=(',', ':'))
+            payload = json.dumps({
+                'images': images,
+                'collections': list(effective_collections),
+            }, separators=(',', ':'))
             try:
-                self._publish_and_wait(self.mqtt_slideshow_available_topic, payload, qos=1, retain=True)
+                if wait_for_publish:
+                    self._publish_and_wait(self.mqtt_slideshow_available_topic, payload, qos=1, retain=True)
+                else:
+                    self._mqtt.publish(self.mqtt_slideshow_available_topic, payload, qos=1, retain=True)
             except Exception:
                 self._mqtt.publish(self.mqtt_slideshow_available_topic, payload, qos=0, retain=True)
             avail_paths = {img['path'] for img in images}
@@ -2948,6 +3035,24 @@ class monitor_and_display:
                 self._write_overrides({'SAMSUNG_TV_ART_MAX_UPLOADS': str(max_uploads)})
                 self.log.info('max_uploads updated to %d', max_uploads)
 
+            # Persist intent before contacting the TV. If the TV is off, this pending
+            # override is retried automatically when Art Mode becomes available.
+            self.slideshow_override = list(paths)
+            self.slideshow_override_pending = True
+            self.shown_content_ids = set()
+            self._last_slideshow_paths = set(paths)
+            self._save_slideshow_override()
+            self._prepare_dynamic_standby(preferred_paths=paths)
+            self._publish_slideshow_state()
+
+            if self.tv is None or not await self.safe_in_artmode():
+                self.log.info(
+                    'Saved slideshow override with %d image(s); TV upload is pending',
+                    len(paths),
+                )
+                ack('ok', f'Saved {len(paths)} image(s); upload will start when the TV enters Art Mode')
+                return
+
             uploaded_paths = {v.get('path_rel', k) for k, v in self.uploaded_files.items()}
             to_upload = [p for p in paths if p not in uploaded_paths]
             needs_cleanup = bool(to_upload)
@@ -2957,7 +3062,7 @@ class monitor_and_display:
                 self._refresh_in_progress = True
                 self._publish_slideshow_state()
                 ack('progress', 'Preparing TV — switching to standby...')
-                await self.ensure_standby_selected()
+                await self.ensure_standby_selected(preferred_paths=paths)
                 if self.standby_content_id:
                     try:
                         await self.tv.select_image(self.standby_content_id)
@@ -2985,12 +3090,8 @@ class monitor_and_display:
                 await self.upload_files(paths)
                 await asyncio.sleep(2)
 
-            self.slideshow_override = paths
+            self.slideshow_override_pending = False
             self._save_slideshow_override()
-            self.shown_content_ids = set()
-            # Mark the applied paths as "previously seen" so the next shuffle
-            # treats them as stale and prefers different images.
-            self._last_slideshow_paths = set(paths)
             self._publish_slideshow_state()
             await self.change_art()
             if needs_cleanup:
@@ -3142,7 +3243,7 @@ class monitor_and_display:
         except Exception as e:
             self.log.debug('CSV reload check skipped due to error: %s', e)
 
-    def _publish_selected_collections_state(self):
+    def _publish_selected_collections_state(self, wait_for_publish=True):
         # Mirror selected collections back to the shared state topic
         if not self.mqtt_enabled or not self._mqtt:
             return
@@ -3158,7 +3259,10 @@ class monitor_and_display:
             # 1) Keep shared selection topic as CSV for Web UI / command flow compatibility
             value = ", ".join(labels)
             try:
-                self._publish_and_wait(self.selection_mqtt_topic, value, qos=1, retain=True)
+                if wait_for_publish:
+                    self._publish_and_wait(self.selection_mqtt_topic, value, qos=1, retain=True)
+                else:
+                    self._mqtt.publish(self.selection_mqtt_topic, value, qos=1, retain=True)
             except Exception:
                 self._mqtt.publish(self.selection_mqtt_topic, value, qos=1, retain=True)
             # 2) Publish HA-safe selected collections sensor state/attributes
@@ -3238,12 +3342,86 @@ class monitor_and_display:
             data = None
 
         try:
+            if cmd == 'ui/debug':
+                event = str(data.get('event', 'unknown'))[:80] if isinstance(data, dict) else 'invalid'
+                details = data.get('details', {}) if isinstance(data, dict) else {}
+                self.log.info(
+                    'Collection UI trace: event=%s details=%s',
+                    event,
+                    json.dumps(details, separators=(',', ':'))[:1000],
+                )
+                return
             if cmd == 'collections/set':
                 cols = []
                 if data and 'collections' in data and isinstance(data['collections'], list):
                     cols = [str(c).strip() for c in data['collections'] if str(c).strip()]
                 elif payload:
                     cols = [c.strip() for c in payload.split(',') if c.strip()]
+                ui_only = bool(data and data.get('ui_only'))
+                if ui_only:
+                    self._ignore_retained_selection_until_reconnect = True
+
+                    def apply_ui_collection_filter():
+                        started = time.monotonic()
+                        self.log.info(
+                            'Collection filter worker started: req_id=%s requested=%s',
+                            req_id,
+                            cols,
+                        )
+                        try:
+                            mapped = []
+                            for collection in cols:
+                                resolved = self._map_to_artwork_dir(collection)
+                                if resolved and resolved not in mapped:
+                                    mapped.append(resolved)
+                            self.log.info(
+                                'Collection filter mapped: req_id=%s mapped=%s elapsed=%.3fs',
+                                req_id,
+                                mapped,
+                                time.monotonic() - started,
+                            )
+                            self.selected_collections = mapped
+                            self._pending_selection_change = False
+                            desired = self.get_selected_folder()
+                            if os.path.isdir(desired):
+                                self.folder = desired
+                            self._publish_ack(
+                                'collections/set',
+                                'ok',
+                                'Collection filter updated; TV unchanged',
+                                req_id,
+                            )
+                            self.log.info(
+                                'Collection filter acknowledged: req_id=%s elapsed=%.3fs',
+                                req_id,
+                                time.monotonic() - started,
+                            )
+                            self._publish_selected_collections_state(wait_for_publish=False)
+                            self._cache_selected_collections()
+                            self._publish_slideshow_available(wait_for_publish=False)
+                            self.log.info(
+                                'Collection filter published: req_id=%s collections=%s elapsed=%.3fs',
+                                req_id,
+                                mapped,
+                                time.monotonic() - started,
+                            )
+                        except Exception as e:
+                            self.log.exception(
+                                'Collection filter worker failed: req_id=%s elapsed=%.3fs',
+                                req_id,
+                                time.monotonic() - started,
+                            )
+                            self._publish_ack('collections/set', 'error', str(e), req_id)
+
+                    worker = threading.Thread(
+                        target=apply_ui_collection_filter,
+                        name='collection-filter-worker',
+                        daemon=True,
+                    )
+                    worker.start()
+                    self.log.info('Collection filter dispatched: req_id=%s', req_id)
+                    return
+
                 # Map incoming values to artwork_dir folder names when possible
                 mapped = []
                 for c in cols:
@@ -3252,13 +3430,9 @@ class monitor_and_display:
                         mapped.append(mc)
                 self.selected_collections = mapped
                 self._pending_selection_change = True
-                self._publish_selected_collections_state()
+                # Automatic callers retain the existing reseed behavior.
+                self._publish_selected_collections_state(wait_for_publish=False)
                 self._cache_selected_collections()
-                # Note: do NOT publish slideshow/available here — the reseed triggered by
-                # _pending_selection_change will call _publish_slideshow_available() when
-                # it completes. Publishing it now would arrive before uploading=true,
-                # causing the UI to prematurely clear slideshowUserRefreshPending and
-                # seed the grid from stale current_paths before the new artwork is ready.
                 self._publish_ack('collections/set', 'ok', 'Collections set', req_id)
                 return
             if cmd == 'collections/add':
@@ -3520,6 +3694,7 @@ class monitor_and_display:
                 return
             if cmd == 'slideshow/override/clear':
                 self.slideshow_override = None
+                self.slideshow_override_pending = False
                 self._save_slideshow_override()
                 self.shown_content_ids = set()
                 self._publish_slideshow_state()
@@ -3602,8 +3777,24 @@ class monitor_and_display:
                 if data and 'collections' in data and isinstance(data['collections'], list):
                     raw_cols = [str(c).strip() for c in data['collections'] if str(c).strip()]
                     preview_cols = [self._map_to_artwork_dir(c) or c for c in raw_cols]
-                self._publish_slideshow_available(override_collections=preview_cols)
-                self._publish_ack('slideshow/available/request', 'ok', 'Available list published', req_id)
+                def publish_available():
+                    self._publish_slideshow_available(
+                        override_collections=preview_cols,
+                        wait_for_publish=False,
+                    )
+                    self._publish_ack(
+                        'slideshow/available/request',
+                        'ok',
+                        'Available list published',
+                        req_id,
+                    )
+
+                worker = threading.Thread(
+                    target=publish_available,
+                    name='slideshow-available-publisher',
+                    daemon=True,
+                )
+                worker.start()
                 return
             if cmd == 'slideshow/preview/request':
                 # Compute a random selection dry-run without uploading anything.
@@ -3710,6 +3901,7 @@ class monitor_and_display:
                     self._load_csv_metadata()
                 except Exception:
                     pass
+                self._prepare_dynamic_standby()
                 try:
                     self._publish_collections_state()
                     self._publish_selected_collections_state()
@@ -3969,17 +4161,28 @@ class monitor_and_display:
             self._maybe_reload_csv_and_publish_collections()
             selection_changed = self.apply_selection()
             update_due = self.update_time > 0 and (time.time() - self.start >= self.update_time)
-            if self.selection_only and not selection_changed and not update_due:
+            override_pending = bool(
+                self.slideshow_override_pending and self.slideshow_override
+            )
+            if self.selection_only and not selection_changed and not update_due and not override_pending:
                 return
             artmode_due = self.artmode_refresh_seconds > 0 and (time.time() - self.last_artmode_check >= self.artmode_refresh_seconds)
-            if not selection_changed and not update_due and not artmode_due:
+            if not selection_changed and not update_due and not artmode_due and not override_pending:
                 self.log.debug('No selection change, update due, or artmode refresh; skipping TV poll')
                 return
-            if not selection_changed and not update_due and artmode_due:
+            if not selection_changed and not update_due and artmode_due and not override_pending:
                 await self.safe_in_artmode()
                 return
             if await self.safe_in_artmode():
-                if selection_changed:
+                if override_pending:
+                    self.log.info(
+                        'TV entered Art Mode; applying pending slideshow override'
+                    )
+                    await self._apply_slideshow_override(
+                        list(self.slideshow_override),
+                        req_id=f'deferred_{int(time.time() * 1000)}',
+                    )
+                elif selection_changed:
                     self.log.info('selection changed, syncing directory: {}'.format(self.folder))
                     await self._do_full_reseed()
                 # update tv art if enabled by timer
@@ -4001,6 +4204,8 @@ class monitor_and_display:
         await self.initialize()
         while True:
             if not await self.safe_in_artmode():
+                if self.tv is None or self.consecutive_failures >= 3:
+                    await self.reconnect_tv()
                 backoff_delay = self.artmode_refresh_seconds or 1
                 if not self._not_in_artmode_logged:
                     self.log.info('TV is not in art mode')
@@ -4181,6 +4386,7 @@ class monitor_and_display:
         """MQTT-triggered refresh: clears slideshow override then reseeds."""
         if self.slideshow_override is not None:
             self.slideshow_override = None
+            self.slideshow_override_pending = False
             self._save_slideshow_override()
             self._publish_slideshow_state()
         await self._do_full_reseed(req_id=req_id)

@@ -21,6 +21,8 @@ Built on top of [NickWaterton/samsung-tv-ws-api](https://github.com/NickWaterton
 - Publishes artwork metadata (title, artist, description, collection) to MQTT for Home Assistant
 - MQTT discovery — entities are auto-created in HA with no manual YAML
 - Built-in web UI (port 8080) for collection selection, settings, and manual refresh
+- Optional dynamic standby artwork generated from the first explicitly selected image, or the first image in the first selected collection, with the bundled image retained as a fallback
+- Offline selection queue — slideshow changes are persisted while the TV is unavailable and applied automatically when it returns to Art Mode
 - **Saved Selections** — name and save any image set as a preset; synced across all clients via retained MQTT; auto-generates thematic defaults (Landscapes, Marine, Impressionism, etc.) on first start
 - **Per-collection carousels** with S/M/L thumbnail size controls and a shuffle preview mode
 - **Drag-and-drop ordering** — reorder hand-picked images in the Selected overview to control sequential playback order; ordinal badges (1, 2, 3…) show the current order
@@ -45,21 +47,20 @@ cp examples/samsung-tv-art.env.example samsung-tv-art.env
 ```
 Open `samsung-tv-art.env` and set at minimum:
 - `SAMSUNG_TV_ART_TV_IP` — the IP address of your Frame TV
-- `SAMSUNG_TV_ART_MQTT_HOST` — your MQTT broker address (enables all MQTT features)
 
-**2. Copy and edit the compose file**
+**2. Copy the compose file**
 ```bash
 cp examples/docker-compose.yml docker-compose.yml
 ```
 
-**3. Start the container**
+The example includes a local Mosquitto broker for MQTT and WebSocket access.
+
+**3. Start the stack**
 ```bash
 docker compose up -d
 ```
 
-Open the web UI at `http://samsung-tv-art.local:8080` (or `http://<host-ip>:8080`).
-
-> **Note:** The `.local` address requires the container to be on the LAN — use `network_mode: host`, a macvlan network, or macvlan+bridge. See `examples/docker-compose.yml` and the Troubleshooting section for details. If using plain bridge networking, access the UI by host IP instead.
+Open the web UI at `http://localhost:8080` or `http://<host-ip>:8080`.
 
 ## Artwork collections
 
@@ -462,5 +463,3 @@ docker logs -f samsung-tv-art
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-

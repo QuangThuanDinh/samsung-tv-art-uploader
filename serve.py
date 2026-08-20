@@ -13,6 +13,14 @@ ROOT_DIR = "/"
 
 class FallbackHandler(SimpleHTTPRequestHandler):
     # directory is passed via functools.partial
+    def end_headers(self):
+        path = urlparse(self.path).path
+        if path in ('', '/') or path.endswith(('.html', '.htm')):
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
+        super().end_headers()
+
     def _json(self, code, payload):
         try:
             data = json.dumps(payload).encode('utf-8')
