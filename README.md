@@ -304,6 +304,8 @@ Key variables:
 | `SAMSUNG_TV_ART_GITHUB_TOKEN` | — | GitHub PAT for private repos |
 | `SAMSUNG_TV_ART_FETCH_ON_START` | `false` | Fetch collections on container start |
 | `SAMSUNG_TV_ART_COLLECTIONS_FROM_CSV` | `true` | Use `artwork_data.csv` inside each collection folder to show friendly artist/collection names in the UI dropdown. Set to `false` to show raw folder names instead |
+| `SAMSUNG_TV_ART_LOG_WEBSOCKET_RESPONSES` | `false` | Log parsed Art WebSocket responses for diagnostics. Sensitive fields are redacted and large payloads are truncated |
+| `SAMSUNG_TV_ART_WEBSOCKET_LOG_MAX_CHARS` | `4000` | Maximum characters logged for each Art WebSocket response |
 | `SAMSUNG_TV_ART_LOCAL_WEB` | `true` | Enable the web UI on port 8080 |
 | `SAMSUNG_TV_ART_MDNS_ENABLE` | `true` | Advertise via mDNS as `<hostname>.local` — requires host, macvlan, or macvlan+bridge networking |
 | `SAMSUNG_TV_ART_MODE_CHECK_SECONDS` | `5` | How often (in seconds) the uploader polls the TV as a fallback to confirm Art Mode state. Art Mode changes are now detected instantly via WebSocket events (`go_to_standby`, `art_mode_changed`, `wakeup`), so the poll interval no longer affects response time. The default of `5` is fine; you can raise it safely if you want less TV chatter. |

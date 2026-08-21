@@ -21,12 +21,6 @@ services:
     restart: unless-stopped
     env_file:
       - ./samsung-tv-art.env
-    environment:
-      SAMSUNG_TV_ART_MQTT_HOST: mosquitto
-      SAMSUNG_TV_ART_MQTT_PORT: "1883"
-      SAMSUNG_TV_ART_MQTT_USERNAME: ""
-      SAMSUNG_TV_ART_MQTT_PASSWORD: ""
-      SAMSUNG_TV_ART_MQTT_WS_PORT: "9001"
     depends_on:
       mosquitto:
         condition: service_healthy
