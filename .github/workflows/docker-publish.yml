@@ -50,7 +50,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/kohlerryan/samsung-tv-art:${{ steps.tag.outputs.TAG }}
+          tags: ghcr.io/quangthuandinh/samsung-tv-art-uploader:${{ steps.tag.outputs.TAG }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -62,7 +63,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/kohlerryan/samsung-tv-art:${{ steps.tag.outputs.TAG }}
-            ghcr.io/kohlerryan/samsung-tv-art:latest
+            ghcr.io/quangthuandinh/samsung-tv-art-uploader:${{ steps.tag.outputs.TAG }}
+            ghcr.io/quangthuandinh/samsung-tv-art-uploader:latest
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
