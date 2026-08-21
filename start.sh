@@ -59,9 +59,9 @@ if [ "$FETCH_ON_START" = "true" ] || [ "$FETCH_ON_START" = "1" ] || [ "$FETCH_ON
     chmod +x /app/scripts/fetch_collections.sh 2>/dev/null || true
     /app/scripts/fetch_collections.sh || echo "Warning: fetch_collections.sh failed"
     # After fetching, (re)aggregate CSV to include newly pulled collections
-    if [ -x "/app/scripts/aggregate_csv.py" ] || [ -f "/app/scripts/aggregate_csv.py" ]; then
+    if [ -f "/app/loop/aggregate_csv.py" ]; then
       echo "Aggregating artwork CSV (runtime)..."
-      python /app/scripts/aggregate_csv.py /app/frame_tv_art_collections /app/artwork_data.csv || echo "Warning: CSV aggregation failed at runtime"
+      python -m loop.aggregate_csv /app/frame_tv_art_collections /app/artwork_data.csv || echo "Warning: CSV aggregation failed at runtime"
     fi
   fi
 else
@@ -71,9 +71,9 @@ fi
 # Ensure aggregated CSV exists even when startup fetch is disabled.
 CSV_PATH="${SAMSUNG_TV_ART_CSV_PATH:-/app/artwork_data.csv}"
 if [ ! -f "$CSV_PATH" ]; then
-  if [ -x "/app/scripts/aggregate_csv.py" ] || [ -f "/app/scripts/aggregate_csv.py" ]; then
+  if [ -f "/app/loop/aggregate_csv.py" ]; then
     echo "CSV missing at $CSV_PATH; generating from $MEDIA_ROOT..."
-    python /app/scripts/aggregate_csv.py "$MEDIA_ROOT" "$CSV_PATH" || echo "Warning: CSV aggregation failed"
+    python -m loop.aggregate_csv "$MEDIA_ROOT" "$CSV_PATH" || echo "Warning: CSV aggregation failed"
   fi
 fi
 # Export so the Python process inherits the resolved path
@@ -256,7 +256,7 @@ if [ "${SAMSUNG_TV_ART_LOCAL_WEB:-true}" = "true" ]; then
 }
 EOF
   # Serve from / with SPA fallback: any unknown path routes to /app/www/index.html
-  python /app/serve.py >/dev/null 2>&1 &
+  python -m loop.serve >/dev/null 2>&1 &
   echo "Local web UI available at http://$PUBLIC_HOST:8080/ (default broker ${WS_URL}); media at /app/frame_tv_art_collections and /media"
 fi
 
@@ -271,7 +271,7 @@ fi
 img_count=$(find "$MEDIA_ROOT" -type f 2>/dev/null | wc -l | tr -d ' ')
 echo "Baked media files under $MEDIA_ROOT: ${img_count}"
 
-exec python /app/uploader.py "$TV_IP" \
+exec python -m loop.uploader "$TV_IP" \
   -f "$ART_DIR" \
   -u "$UPDATE_MINUTES" \
   -c "$CHECK_SECONDS" \

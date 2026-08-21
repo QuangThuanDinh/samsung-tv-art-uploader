@@ -62,9 +62,10 @@ import argparse
 import csv
 import unicodedata
 from signal import SIGTERM, SIGINT
-from standy_util import refresh_dynamic_standby
-from mqtt_integration import MQTTIntegrationMixin, _MatteRejectedError
-from pil_methods import PIL_methods
+from .standy_util import refresh_dynamic_standby
+from .mqtt_integration import MQTTIntegrationMixin, _MatteRejectedError
+from .pil_methods import PIL_methods
+from .tv_connection import FrameTVConnection
 HAVE_PIL = False
 try:
     # Import Pillow submodules defensively. In some runtime environments a
@@ -80,9 +81,6 @@ try:
     HAVE_PIL = True
 except Exception:
     HAVE_PIL = False
-
-# from samsungtvws.async_art import SamsungTVAsyncArt  # Moved inside class
-# from samsungtvws import __version__  # Not used
 
 logging.basicConfig(level=logging.INFO)
 
@@ -344,48 +342,14 @@ class monitor_and_display(MQTTIntegrationMixin):
     
     def _create_tv_connection(self):
         """Create TV connection object. May raise if TV is unreachable."""
-        import socket
-        from samsungtvws.async_art import SamsungTVAsyncArt
-        device_name = os.environ.get('SAMSUNG_TV_ART_DEVICE_NAME') or socket.gethostname() or 'SamsungTvRemote'
-        # Port 8002 is the SSL WebSocket (default for most models). Some Tizen 9.0
-        # firmwares (Frame 2024+) filter 8002 and require the plain port 8001.
-        tv_port = int(os.environ.get('SAMSUNG_TV_ART_PORT', '8002'))
-        self.tv = SamsungTVAsyncArt(host=self.ip, port=tv_port, token_file=self.token_file, name=device_name)
         self._artmode_event = asyncio.Event()
-        self._register_artmode_callbacks()
-
-    def _register_artmode_callbacks(self):
-        """Register WebSocket event callbacks so art mode changes wake the main loop instantly."""
-        def _signal_artmode_change():
-            if self._artmode_event:
-                self._artmode_event.set()
-
-        async def _on_go_to_standby(event, response):
-            self.log.debug('TV WebSocket event: go_to_standby')
-            # Don't update _in_art_mode here — let safe_in_artmode() own all state
-            # transitions so MQTT publishing logic fires correctly.
-            _signal_artmode_change()
-
-        async def _on_art_mode_changed(event, response):
-            try:
-                data = json.loads(response['data'])
-                new_state = data.get('status') == 'on'
-            except Exception:
-                new_state = None
-            self.log.debug('TV WebSocket event: art_mode_changed (status=%s)', new_state)
-            # Don't write _in_art_mode directly — just wake the loop.
-            _signal_artmode_change()
-
-        async def _on_wakeup(event, response):
-            self.log.debug('TV WebSocket event: wakeup')
-            _signal_artmode_change()
-
-        try:
-            self.tv.callbacks['go_to_standby'] = _on_go_to_standby
-            self.tv.callbacks['art_mode_changed'] = _on_art_mode_changed
-            self.tv.callbacks['wakeup'] = _on_wakeup
-        except Exception as e:
-            self.log.warning('Failed to register TV artmode callbacks: %s', e)
+        self.tv = FrameTVConnection(
+            host=self.ip,
+            token_file=self.token_file,
+            artmode_event=self._artmode_event,
+            logger=self.log,
+            reconnect_delay=self.reconnect_delay,
+        )
         
     async def start_monitoring(self):
         '''
@@ -533,49 +497,13 @@ class monitor_and_display(MQTTIntegrationMixin):
             except Exception as e:
                 self.log.debug('TV still unavailable during reconnect: %s', e)
                 return False
-        try:
-            await self.tv.close()
-        except Exception:
-            pass
-        for attempt in range(1, 6):
-            try:
-                await asyncio.sleep(self.reconnect_delay * attempt)
-                await self.tv.start_listening()
-                if self.tv.is_alive():
-                    self.log.info('Reconnected to TV on attempt %d', attempt)
-                    return True
-            except Exception as e:
-                self.log.warning('Reconnect attempt %d failed: %s', attempt, e)
-        return False
-
-    async def _query_artmode(self):
-        """Determine Art Mode, resilient to legacy Frame TVs.
-
-        Tries tv.in_artmode() first; if it reports false OR raises, falls back to an
-        explicit get_artmode() request (with one retry). get_artmode() doesn't depend
-        on the REST PowerState field that legacy models (e.g. 17_KANTM_UHD, Art API
-        1.07) omit — those make tv.on() False and tv.in_artmode() False even in Art
-        Mode. Raises if the TV can't be queried at all, so callers can apply backoff.
-        """
-        try:
-            if await self.tv.in_artmode():
-                return True
-        except Exception as e:
-            self.log.debug('in_artmode() failed, falling back to get_artmode(): %s', e)
-        last_err = None
-        for attempt in range(2):
-            try:
-                return str(await self.tv.get_artmode()).lower() == 'on'
-            except Exception as e:
-                last_err = e
-                self.log.debug('get_artmode() attempt %d failed: %s', attempt + 1, e)
-        raise last_err if last_err else AssertionError('artmode query failed')
+        return await self.tv.reconnect()
 
     async def safe_in_artmode(self):
         """Return True if TV reports art mode; False on any error. Uses exponential backoff."""
         try:
             self.last_artmode_check = time.time()
-            in_artmode = await self._query_artmode()
+            in_artmode = await self.tv.query_artmode()
             # Success - reset failure counter
             self.consecutive_failures = 0
             prev = self._in_art_mode

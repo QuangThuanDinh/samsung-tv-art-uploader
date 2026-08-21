@@ -170,4 +170,3 @@ class PIL_methods:
         equal_content = diff <= 1.0                 #pick a threshhold
         self.log.debug('equal_content: {}, diff: {}'.format(equal_content, diff))
         return equal_content
-

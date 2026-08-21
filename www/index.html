@@ -1844,10 +1844,9 @@
         $applyEnv.disabled = true; $applyEnv.style.opacity = 0.5;
         $restartEnv.disabled = true; $restartEnv.style.opacity = 0.5;
         if ($refresh) { $refresh.disabled = true; $refresh.style.opacity = 0.5; }
-        if ($slApply) { $slApply.disabled = true; $slApply.style.opacity = 0.5; }
         if ($envMsg) {
           $envMsg.textContent = notInArtMode
-            ? 'TV is not in Art Mode \u2014 Refresh and Settings unavailable.'
+            ? 'TV is not in Art Mode \u2014 Refresh and TV settings unavailable.'
             : 'Waiting for artwork \u2014 Refresh and Settings will unlock once the uploader connects.';
         }
       } else {
@@ -2793,7 +2792,7 @@
       const mins = parseInt($slInterval.value || '0', 10);
       const maxU = parseInt($slMaxUploads ? ($slMaxUploads.value || '10') : '10', 10);
       const dirty = seq !== slSeqBaseline || mins !== slIntervalBaseline || maxU !== slMaxUploadsBaseline;
-      const canApply = dirty && !tvBlocked && !refreshInProgress && !isSlideshowActionLocked();
+      const canApply = dirty && !refreshInProgress && !isSlideshowActionLocked();
       $slApply.disabled = !canApply;
       $slApply.style.opacity = canApply ? 1 : 0.6;
     }

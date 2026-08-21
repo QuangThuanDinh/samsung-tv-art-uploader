@@ -15,7 +15,7 @@ Aggregate per-collection CSV files into a single artwork_data.csv.
 - Writes a unified CSV with headers = union of all encountered columns plus artwork_file and artwork_dir
 
 Usage:
-  python aggregate_csv.py <collections_root> <output_csv>
+  python -m loop.aggregate_csv <collections_root> <output_csv>
 """
 
 REQUIRED_HEADERS = ["artwork_file", "artwork_dir"]

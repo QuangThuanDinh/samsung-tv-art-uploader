@@ -393,8 +393,14 @@ The `./data` bind-mount stores files that survive container restarts:
 samsung-tv-art/
 ├── Dockerfile
 ├── start.sh               — container entrypoint: fetches collections, starts uploader
-├── uploader.py            — main TV uploader and MQTT integration
-├── serve.py               — minimal HTTP server for the web UI
+├── loop/                   — backend runtime package
+│   ├── uploader.py        — main TV uploader loop
+│   ├── tv_connection.py   — TV WebSocket lifecycle and Art Mode queries
+│   ├── mqtt_integration.py — MQTT, settings, collections, and slideshow integration
+│   ├── pil_methods.py     — Pillow-based image synchronization
+│   ├── standy_util.py     — dynamic standby image helper
+│   ├── aggregate_csv.py   — collection metadata aggregation
+│   └── serve.py           — minimal HTTP server for the web UI
 ├── assets/
 │   ├── standby.png                                      — default standby artwork baked into the image
 │   ├── hacard_fixed_v0.2.1.png                          — HA card fixed layout screenshot

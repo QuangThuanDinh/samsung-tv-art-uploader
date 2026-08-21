@@ -1860,7 +1860,7 @@ class MQTTIntegrationMixin:
                 try:
                     self._publish_ack('collections/refresh', 'progress', 'Rebuilding artwork database from CSV...', req_id)
                     proc2 = await asyncio.create_subprocess_exec(
-                        'python', '/app/scripts/aggregate_csv.py', '/app/frame_tv_art_collections', '/app/artwork_data.csv',
+                        'python', '-m', 'loop.aggregate_csv', '/app/frame_tv_art_collections', '/app/artwork_data.csv',
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )

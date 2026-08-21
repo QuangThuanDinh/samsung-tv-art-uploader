@@ -18,11 +18,7 @@ RUN --mount=type=secret,id=pip_index_url,required=false \
 
 WORKDIR /app
 COPY start.sh /app/start.sh
-COPY serve.py /app/serve.py
-COPY standy_util.py /app/standy_util.py
-COPY mqtt_integration.py /app/mqtt_integration.py
-COPY pil_methods.py /app/pil_methods.py
-COPY uploader.py /app/uploader.py
+COPY loop/ /app/loop/
 COPY scripts/ /app/scripts/
 RUN chmod +x /app/scripts/*.sh || true
 

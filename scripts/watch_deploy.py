@@ -18,7 +18,7 @@ Python sources (sync over SSH, then restart a container):
   python scripts/watch_deploy.py --label python \
     --host HOST --port 22 --remote-path /srv/app \
     --restart-container art-uploader --docker-bin /usr/local/bin/docker \
-    --watch uploader.py serve.py
+    --sync-dir loop/:loop/
 
 Static assets (sync over SSH, no restart):
 
