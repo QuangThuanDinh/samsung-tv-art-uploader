@@ -135,10 +135,7 @@ class monitor_and_display(MQTTIntegrationMixin):
         self._pending_selection_change = False
         self._ignore_retained_selection_until_reconnect = False
         self.selection_only = os.environ.get('SAMSUNG_TV_ART_SELECTION_ONLY', '').lower() in ['1', 'true', 'yes']
-        self.artmode_refresh_seconds = int(os.environ.get('SAMSUNG_TV_ART_MODE_CHECK_SECONDS', '1'))
-        self.last_artmode_check = 0
         self.consecutive_failures = 0
-        self.max_backoff_seconds = 15  # Max 15 seconds between art mode re-checks
         self.reconnect_delay = 5
         self.update_time = int(max(0, update_time*60))   #convert minutes to seconds
         self.period = min(max(5, period), self.update_time) if self.update_time > 0 else period
@@ -273,7 +270,8 @@ class monitor_and_display(MQTTIntegrationMixin):
         self._last_slideshow_paths = set() # path_rel values from the previous seed, used to avoid re-picking the same images
         self._loop = None
         self._collections_sync_running = False
-        self._artmode_event = None         # asyncio.Event set when TV signals an art mode change
+        self._artmode_event = asyncio.Event()  # Set when TV signals an Art Mode change
+        self._status_check_needed = True
         self._not_in_artmode_logged = False    # suppress repeated 'not in art mode' messages
         self._tv_shutdown_signaled = False
         self._tv_off_confirmed = False
@@ -347,7 +345,6 @@ class monitor_and_display(MQTTIntegrationMixin):
     
     def _create_tv_connection(self):
         """Create TV connection object. May raise if TV is unreachable."""
-        self._artmode_event = asyncio.Event()
         self.tv = FrameTVConnection(
             host=self.ip,
             token_file=self.token_file,
@@ -358,6 +355,7 @@ class monitor_and_display(MQTTIntegrationMixin):
         )
 
     def _handle_tv_power_signal(self, state):
+        self._status_check_needed = True
         if state == 'standby':
             self._tv_shutdown_signaled = True
             self._tv_off_confirmed = False
@@ -511,6 +509,7 @@ class monitor_and_display(MQTTIntegrationMixin):
 
     async def reconnect_tv(self, power_verified=False):
         """Replace a dropped Art client; never reopen the old WebSocket object."""
+        self._status_check_needed = True
         old_tv = self.tv
         if old_tv is not None:
             old_tv.retire()
@@ -541,14 +540,19 @@ class monitor_and_display(MQTTIntegrationMixin):
     async def _safe_in_artmode_unlocked(self, allow_during_refresh=False):
         """Return True if TV reports art mode; False on any error. Uses exponential backoff."""
         try:
-            self.last_artmode_check = time.time()
             if self.tv is None:
                 self._create_tv_connection()
             try:
                 powered_on = await self.tv.is_powered_on()
             except Exception as e:
                 self.log.debug('TV REST power probe failed: %s', e)
-                powered_on = False
+                self.tv.retire()
+                self._tv_powered_on = None
+                self._in_art_mode = None
+                self.consecutive_failures += 1
+                self._status_check_needed = True
+                self._publish_mqtt_state('Unknown status', 'unknown', None)
+                return False
 
             if not powered_on:
                 self._tv_off_confirmed = True
@@ -557,6 +561,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 power_was_on = self._tv_powered_on is not False
                 self._tv_powered_on = False
                 self._in_art_mode = False
+                self._status_check_needed = False
                 self.consecutive_failures = 0
                 if prev is True or power_was_on:
                     self._publish_mqtt_state('TV Power Off', 'power_off', None)
@@ -580,6 +585,7 @@ class monitor_and_display(MQTTIntegrationMixin):
 
             if self.tv.retired or not self.tv.is_alive():
                 if not await self.reconnect_tv(power_verified=True):
+                    self.consecutive_failures += 1
                     self._in_art_mode = None
                     self._publish_mqtt_state('Unknown status', 'unknown', None)
                     return False
@@ -589,6 +595,7 @@ class monitor_and_display(MQTTIntegrationMixin):
             self.consecutive_failures = 0
             prev = self._in_art_mode
             self._in_art_mode = bool(in_artmode)
+            self._status_check_needed = False
             if prev is not False and not in_artmode:
                 # TV just left art mode — publish sentinel with in_art_mode: False so UIs disable
                 self._publish_mqtt_state('Unavailable', 'unavailable', None)
@@ -616,6 +623,7 @@ class monitor_and_display(MQTTIntegrationMixin):
             log_fn = self.log.warning if self.consecutive_failures == 1 else self.log.debug
             log_fn('TV artmode check failed (empty response, failure %d); status unknown', self.consecutive_failures)
             self._in_art_mode = None
+            self._status_check_needed = True
             self._publish_mqtt_state('Unknown status', 'unknown', None)
             return False
         except Exception as e:
@@ -623,16 +631,14 @@ class monitor_and_display(MQTTIntegrationMixin):
             log_fn = self.log.warning if self.consecutive_failures == 1 else self.log.debug
             log_fn('TV artmode check failed (failure %d): %s', self.consecutive_failures, e)
             self._in_art_mode = None
+            self._status_check_needed = True
             self._publish_mqtt_state('Unknown status', 'unknown', None)
             return False
 
     def get_backoff_delay(self):
         """Calculate exponential backoff delay based on consecutive failures."""
-        if self.consecutive_failures <= 1:
-            return self.artmode_refresh_seconds or 1
-        # Exponential backoff: 1, 2, 4... (capped at max_backoff_seconds)
-        delay = min(1 * (2 ** (self.consecutive_failures - 1)), self.max_backoff_seconds)
-        return delay
+        # Failure-only retry cadence: 1, 2, 4, then every 8 seconds.
+        return min(2 ** max(0, self.consecutive_failures - 1), 8)
 
     async def cleanup_old_uploads(self, protect_current=True):
         """Delete previously uploaded photos from the TV in small batches to avoid overwhelming it."""
@@ -2257,12 +2263,8 @@ class monitor_and_display(MQTTIntegrationMixin):
                 )
                 if self.selection_only and not selection_changed and not update_due and not override_pending:
                     return
-                artmode_due = self.artmode_refresh_seconds > 0 and (time.time() - self.last_artmode_check >= self.artmode_refresh_seconds)
-                if not selection_changed and not update_due and not artmode_due and not override_pending:
-                    self.log.debug('No selection change, update due, or artmode refresh; skipping TV poll')
-                    return
-                if not selection_changed and not update_due and artmode_due and not override_pending:
-                    await self._safe_in_artmode_unlocked()
+                if not selection_changed and not update_due and not override_pending:
+                    self.log.debug('No selection change or update due; skipping TV poll')
                     return
                 if not await self._safe_in_artmode_unlocked():
                     self.log.info('artmode or tv is off')
@@ -2293,6 +2295,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 await self._do_full_reseed()
         except Exception as e:
             self.log.warning('error in check_dir, attempting reconnect: %s', e)
+            self._status_check_needed = True
             await self.reconnect_tv()
 
     async def select_artwork(self):
@@ -2301,30 +2304,84 @@ class monitor_and_display(MQTTIntegrationMixin):
         initialize, check directory for changed files and update
         '''
         await self.initialize()
+        self._status_check_needed = True
         while True:
             if self._refresh_in_progress:
                 await asyncio.sleep(0.25)
                 continue
-            if not await self.safe_in_artmode():
+
+            # Poll Art Mode only when its state is unknown, after a TV event, or
+            # while REST reports that the TV is powered off. Valid on/off Art
+            # responses remain authoritative until an event or a major action
+            # requests a fresh check.
+            if self._status_check_needed or self._tv_powered_on is False:
+                self._artmode_event.clear()
+                in_artmode = await self.safe_in_artmode()
+            else:
+                in_artmode = self._in_art_mode is True
+
+            if not in_artmode:
+                if self._refresh_in_progress:
+                    self._status_check_needed = True
+                    await asyncio.sleep(0.25)
+                    continue
+                status_unknown = (
+                    self._tv_powered_on is None or self._in_art_mode is None
+                )
+                powered_off = self._tv_powered_on is False
                 backoff_delay = (
                     max(5, int(os.environ.get('SAMSUNG_TV_ART_POWER_PROBE_SECONDS', '10')))
-                    if self._tv_off_confirmed or self._tv_shutdown_signaled
+                    if powered_off
                     else self.get_backoff_delay()
                 )
                 if not self._not_in_artmode_logged:
-                    self.log.info('TV is not in art mode')
+                    self.log.info(
+                        'TV Art Mode status is %s',
+                        'unknown' if status_unknown else 'off',
+                    )
                     self._not_in_artmode_logged = True
                 else:
-                    self.log.debug('TV is not in art mode')
-                if self._artmode_event:
-                    self._artmode_event.clear()
+                    self.log.debug(
+                        'TV Art Mode status is %s',
+                        'unknown' if status_unknown else 'off',
+                    )
+                if self._artmode_event.is_set():
+                    event_received = True
+                    self.log.debug('Art mode event received — rechecking immediately')
+                else:
+                    event_received = False
                     try:
-                        await asyncio.wait_for(self._artmode_event.wait(), timeout=backoff_delay)
+                        if status_unknown or powered_off:
+                            await asyncio.wait_for(
+                                self._artmode_event.wait(),
+                                timeout=backoff_delay,
+                            )
+                        else:
+                            await asyncio.wait_for(
+                                self._artmode_event.wait(),
+                                timeout=max(
+                                    5,
+                                    int(os.environ.get(
+                                        'SAMSUNG_TV_ART_POWER_PROBE_SECONDS',
+                                        '10',
+                                    )),
+                                ),
+                            )
+                        event_received = True
                         self.log.debug('Art mode event received — rechecking immediately')
                     except asyncio.TimeoutError:
-                        pass
-                else:
-                    await asyncio.sleep(backoff_delay)
+                        if (
+                            not status_unknown
+                            and not powered_off
+                            and (
+                                self.tv is None
+                                or self.tv.retired
+                                or not self.tv.is_alive()
+                            )
+                        ):
+                            self._status_check_needed = True
+                if status_unknown or powered_off or event_received:
+                    self._status_check_needed = True
                 continue
             self._not_in_artmode_logged = False
             await self.check_dir()
@@ -2339,15 +2396,16 @@ class monitor_and_display(MQTTIntegrationMixin):
                 pass
             if self.period == 0:
                 break
-            if self._artmode_event:
-                self._artmode_event.clear()
+            if self._artmode_event.is_set():
+                self._status_check_needed = True
+                continue
+            else:
                 try:
                     await asyncio.wait_for(self._artmode_event.wait(), timeout=self.period)
                     self.log.debug('Art mode event received during idle — rechecking')
+                    self._status_check_needed = True
                 except asyncio.TimeoutError:
                     pass
-            else:
-                await asyncio.sleep(self.period)
 
     async def _publish_current_artwork_state(self, force=False, state_locked=False):
         """Poll current TV artwork and publish MQTT state/attributes.
@@ -2363,7 +2421,8 @@ class monitor_and_display(MQTTIntegrationMixin):
             try:
                 cid = await self.get_current_artwork()
             except Exception:
-                cid = None
+                self._status_check_needed = True
+                return
         finally:
             if not state_locked:
                 self._tv_state_lock.release()

@@ -310,7 +310,6 @@ Key variables:
 | `SAMSUNG_TV_ART_WEBSOCKET_LOG_MAX_CHARS` | `4000` | Maximum characters logged for each Art WebSocket response |
 | `SAMSUNG_TV_ART_LOCAL_WEB` | `true` | Enable the web UI on port 8080 |
 | `SAMSUNG_TV_ART_MDNS_ENABLE` | `true` | Advertise via mDNS as `<hostname>.local` — requires host, macvlan, or macvlan+bridge networking |
-| `SAMSUNG_TV_ART_MODE_CHECK_SECONDS` | `5` | How often (in seconds) the uploader polls the TV as a fallback to confirm Art Mode state. Art Mode changes are now detected instantly via WebSocket events (`go_to_standby`, `art_mode_changed`, `wakeup`), so the poll interval no longer affects response time. The default of `5` is fine; you can raise it safely if you want less TV chatter. |
 | `SAMSUNG_TV_ART_MAX_FILE_BYTES` | _(unset)_ | Maximum encoded image size in bytes. When set, the uploader will progressively JPEG-compress any image that exceeds it. If quality reduction alone can't shrink the file enough, the image is also scaled to half resolution and compression retried. Useful for TVs or network configurations that reject large uploads. Leave unset on modern TVs — no recompression is applied by default. |
 | `SAMSUNG_TV_ART_MAX_DIMENSION` | _(unset)_ | Caps the maximum image resolution before upload, e.g. `1920x1080`. Accepts `WxH` or a single number for a square cap. Useful for 1080p Frame TVs that reject oversized images regardless of file size. |
 
