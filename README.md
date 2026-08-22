@@ -164,7 +164,7 @@ your-collection-repo/
 
 #### Selecting collections from the web UI (recommended)
 
-The easiest way to manage collections is via the **Settings → Collections** tab in the web UI. All 54 available artist collections from [github.com/kohlerryan](https://github.com/kohlerryan?tab=repositories) are listed as checkboxes — check the ones you want, hit **Save List**, then click **Update & Refresh** to fetch and seed the TV.
+The easiest way to manage collections is via the **Settings → Collections** tab in the web UI. All 54 available artist collections from [github.com/kohlerryan](https://github.com/kohlerryan?tab=repositories) are listed as checkboxes. **Save List** only saves the repository list. **Pull List** saves and downloads that list, then rebuilds local artwork metadata without contacting the TV. **Update & Refresh** downloads the list and also reseeds the TV.
 
 Custom or third-party repository URLs can be pasted into the **Custom Repositories** text area below the checkbox grid, one URL per line.
 
@@ -386,6 +386,7 @@ The `./data` bind-mount stores files that survive container restarts:
 | `frame_tv/selected_collections/state` | publish / subscribe | Active collection names |
 | `frame_tv/collections/attributes` | publish | All available collections list |
 | `frame_tv/cmd/collections/refresh` | subscribe | Trigger a Refresh |
+| `frame_tv/cmd/settings/pull_collections` | subscribe | Trigger a local collection fetch and metadata rebuild without TV operations |
 | `frame_tv/cmd/settings/sync_collections` | subscribe | Trigger Update & Refresh (git fetch + reseed) |
 | `frame_tv/ack/collections/refresh` | publish | Progress acks during refresh |
 

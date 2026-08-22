@@ -52,8 +52,7 @@ if [ -z "$COL_LIST" ] && [ -f "$LIST_FILE" ]; then
 fi
 
 if [ -z "$COL_LIST" ]; then
-  echo "No collections defined (SAMSUNG_TV_ART_COLLECTIONS or $LIST_FILE). Skipping fetch." >&2
-  exit 0
+  echo "No collections defined (SAMSUNG_TV_ART_COLLECTIONS or $LIST_FILE). Pruning managed repositories."
 fi
 
 mkdir -p "$COL_DIR"

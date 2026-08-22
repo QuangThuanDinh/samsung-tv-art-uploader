@@ -1478,6 +1478,13 @@ class MQTTIntegrationMixin:
                     return
                 self._publish_ack('collections/refresh', 'queued', 'Update & refresh queued', req_id)
                 return
+            if cmd == 'settings/pull_collections':
+                fut = self._schedule_command_coro(self._do_pull_collections(req_id=req_id), 'settings/pull_collections')
+                if not fut:
+                    self._publish_ack('settings/pull_collections', 'error', 'Failed to queue collection pull', req_id)
+                    return
+                self._publish_ack('settings/pull_collections', 'queued', 'Fetching list...', req_id)
+                return
             if cmd == 'artwork/set':
                 # Accept either { "path": "Collection/file.jpg" } or a plain string payload
                 path = None
@@ -1810,95 +1817,112 @@ class MQTTIntegrationMixin:
         except Exception as e:
             self._publish_ack(cmd, 'error', f'Exception: {e}', req_id)
 
+    async def _update_local_collections(self, ack_cmd, req_id):
+        """Fetch configured repositories, rebuild metadata, and publish collection state."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                '/bin/sh', '-c', 'chmod +x /app/scripts/fetch_collections.sh 2>/dev/null || true; /app/scripts/fetch_collections.sh',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            output_tail = []
+            fetch_errors = []
+            async for raw_line in proc.stdout:
+                line = raw_line.decode('utf-8', errors='replace').strip()
+                if line:
+                    output_tail.append(line)
+                    output_tail = output_tail[-10:]
+                    if line.startswith(('Warning:', 'Clone failed')):
+                        fetch_errors.append(line)
+                match = re.match(r'^(?:Updating|Cloning) collection (.+?) from ', line)
+                if match:
+                    name = match.group(1).replace('_', ' ')
+                    self._publish_ack(ack_cmd, 'progress', f'Fetching list {name}...', req_id)
+            await proc.wait()
+            if proc.returncode != 0 or fetch_errors:
+                self.log.warning(
+                    'On-demand collections fetch failed rc=%s output=%s',
+                    proc.returncode,
+                    '\n'.join(output_tail)[:1000],
+                )
+                self._publish_ack(ack_cmd, 'error', 'Git fetch failed — check container logs', req_id)
+                return False
+        except Exception as e:
+            self.log.warning('On-demand collections fetch exception: %s', e)
+            self._publish_ack(ack_cmd, 'error', 'Git fetch failed — check container logs', req_id)
+            return False
+
+        try:
+            self._publish_ack(ack_cmd, 'progress', 'Rebuilding artwork database...', req_id)
+            proc = await asyncio.create_subprocess_exec(
+                'python', '-m', 'loop.aggregate_csv', '/app/frame_tv_art_collections', '/app/artwork_data.csv',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _out, err = await proc.communicate()
+            if proc.returncode != 0:
+                self.log.warning(
+                    'On-demand CSV aggregate failed rc=%s err=%s',
+                    proc.returncode,
+                    (err or b'').decode('utf-8', errors='ignore')[:400],
+                )
+                self._publish_ack(ack_cmd, 'error', 'CSV rebuild failed — check container logs', req_id)
+                return False
+        except Exception as e:
+            self.log.warning('On-demand CSV aggregate exception: %s', e)
+            self._publish_ack(ack_cmd, 'error', 'CSV rebuild failed — check container logs', req_id)
+            return False
+
+        self._publish_ack(ack_cmd, 'progress', 'Reloading collection metadata...', req_id)
+        self._load_csv_metadata()
+        self._prepare_dynamic_standby()
+        self._publish_collections_state()
+        self._publish_selected_collections_state()
+        self._publish_settings_state()
+        return True
+
+    async def _do_pull_collections(self, req_id=None):
+        """Update local collection repositories and metadata without touching the TV."""
+        ack_cmd = 'settings/pull_collections'
+        if self._collections_sync_running:
+            self.log.info('%s ignored: collection update already running', ack_cmd)
+            self._publish_ack(ack_cmd, 'error', 'Collection update already running', req_id)
+            return
+        self._collections_sync_running = True
+        try:
+            self.log.info('%s started (req_id=%s)', ack_cmd, req_id)
+            self._publish_ack(ack_cmd, 'started', 'Fetching list...', req_id)
+            if await self._update_local_collections(ack_cmd, req_id):
+                self._publish_ack(ack_cmd, 'ok', 'Collections updated', req_id)
+        except Exception as e:
+            self.log.warning('%s exception: %s', ack_cmd, e)
+            self._publish_ack(ack_cmd, 'error', f'Exception: {e}', req_id)
+        finally:
+            self._collections_sync_running = False
+
     async def _do_sync_collections(self, req_id=None):
-        """Fetch git repos → rebuild CSV → reload metadata → reseed TV.
-        All acks go to collections/refresh so the same progress log as Refresh is reused.
-        """
+        """Fetch git repos → rebuild CSV → reload metadata → reseed TV."""
+        ack_cmd = 'collections/refresh'
         if self._collections_sync_running:
             self.log.info('settings/sync_collections ignored: already running')
-            self._publish_ack('collections/refresh', 'error', 'Update already running', req_id)
+            self._publish_ack(ack_cmd, 'error', 'Update already running', req_id)
             return
         self._collections_sync_running = True
         try:
             self.log.info('settings/sync_collections started (req_id=%s)', req_id)
-            self._publish_ack('collections/refresh', 'started', 'Fetching latest collection updates...', req_id)
-
-            has_sources = bool(os.environ.get('SAMSUNG_TV_ART_COLLECTIONS')) or os.path.isfile('/data/collections.list')
-            if not has_sources:
-                self.log.info('settings/sync_collections: no git sources configured; reseeding from local files only')
-                # Refresh the collections dropdown even when there are no git sources — the
-                # user may have added/removed folders in the media root since last startup.
-                try:
-                    self._publish_collections_state()
-                    self._publish_selected_collections_state()
-                    self._publish_settings_state()
-                except Exception:
-                    pass
-            else:
-                fetch_ok = True
-                try:
-                    self._publish_ack('collections/refresh', 'progress', 'Fetching from git repositories...', req_id)
-                    proc = await asyncio.create_subprocess_exec(
-                        '/bin/sh', '-c', 'chmod +x /app/scripts/fetch_collections.sh 2>/dev/null || true; /app/scripts/fetch_collections.sh',
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    _out, err = await proc.communicate()
-                    if proc.returncode != 0:
-                        fetch_ok = False
-                        self.log.warning('On-demand collections fetch failed rc=%s err=%s', proc.returncode, (err or b'').decode('utf-8', errors='ignore')[:400])
-                except Exception as e:
-                    fetch_ok = False
-                    self.log.warning('On-demand collections fetch exception: %s', e)
-
-                if not fetch_ok:
-                    self.log.warning('settings/sync_collections failed during fetch')
-                    self._publish_ack('collections/refresh', 'error', 'Git fetch failed — check container logs', req_id)
-                    return
-
-                csv_ok = True
-                try:
-                    self._publish_ack('collections/refresh', 'progress', 'Rebuilding artwork database from CSV...', req_id)
-                    proc2 = await asyncio.create_subprocess_exec(
-                        'python', '-m', 'loop.aggregate_csv', '/app/frame_tv_art_collections', '/app/artwork_data.csv',
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    _out2, err2 = await proc2.communicate()
-                    if proc2.returncode != 0:
-                        csv_ok = False
-                        self.log.warning('On-demand CSV aggregate failed rc=%s err=%s', proc2.returncode, (err2 or b'').decode('utf-8', errors='ignore')[:400])
-                except Exception as e:
-                    csv_ok = False
-                    self.log.warning('On-demand CSV aggregate exception: %s', e)
-
-                if not csv_ok:
-                    self.log.warning('settings/sync_collections failed during csv aggregation')
-                    self._publish_ack('collections/refresh', 'error', 'Git fetch done — CSV rebuild failed', req_id)
-                    return
-
-                try:
-                    self._publish_ack('collections/refresh', 'progress', 'Reloading collection metadata...', req_id)
-                    self._load_csv_metadata()
-                except Exception:
-                    pass
-                self._prepare_dynamic_standby()
-                try:
-                    self._publish_collections_state()
-                    self._publish_selected_collections_state()
-                    self._publish_settings_state()
-                except Exception:
-                    pass
+            self._publish_ack(ack_cmd, 'started', 'Fetching latest collection updates...', req_id)
+            if not await self._update_local_collections(ack_cmd, req_id):
+                return
 
             if self.tv is None:
                 self.log.info('settings/sync_collections: TV unavailable — skipping reseed, collections updated on disk only')
-                self._publish_ack('collections/refresh', 'done', 'Collections updated. TV reseed will happen automatically once the TV is reachable.', req_id)
+                self._publish_ack(ack_cmd, 'done', 'Collections updated. TV reseed will happen automatically once the TV is reachable.', req_id)
             else:
                 self.log.info('settings/sync_collections proceeding to TV reseed (req_id=%s)', req_id)
                 await self._do_full_reseed(req_id=req_id, skip_started_ack=True)
         except Exception as e:
             self.log.warning('settings/sync_collections exception: %s', e)
-            self._publish_ack('collections/refresh', 'error', f'Exception: {e}', req_id)
+            self._publish_ack(ack_cmd, 'error', f'Exception: {e}', req_id)
         finally:
             self._collections_sync_running = False
 

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Frame TV Art</title>
   <link rel="icon" type="image/png" href="/favicon.png" />
-  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <script src="https://unpkg.com/mqtt@5.14.1/dist/mqtt.min.js"></script>
   <style>
     /* Theme */
     html {
@@ -579,6 +579,7 @@
             </div>
             <div style="display:flex; gap:8px; margin-top:6px; align-items:center;">
               <button id="collections-list-save" disabled style="opacity:0.6;">Save List</button>
+              <button id="collections-list-pull">Pull List</button>
               <span id="collections-list-msg" class="hint"></span>
             </div>
           </div>
@@ -935,6 +936,15 @@
               }
               if (cmd === 'settings/restart') {
                 $envMsg.textContent = status === 'ok' ? 'Restarting uploader...' : `Restart error: ${ack.message||'unknown'}`;
+              }
+              if (cmd === 'settings/pull_collections' && String(ack.req_id || '') === String(_collPullReqId || '')) {
+                if (status === 'queued' || status === 'started' || status === 'progress') {
+                  $collListMsg.textContent = ack.message || 'Fetching list...';
+                } else if (status === 'ok' || status === 'error') {
+                  $collListPull.disabled = false;
+                  _collPullReqId = null;
+                  $collListMsg.textContent = status === 'error' ? `Error: ${ack.message || 'unknown'}` : '';
+                }
               }
               if (cmd === 'collections/refresh') {
                 const msg = (ack && ack.message) || '';
@@ -1727,6 +1737,7 @@
       { repo: 'Winslow_Homer',                 label: 'Winslow Homer' },
     ];
     const $collListSave  = document.getElementById('collections-list-save');
+    const $collListPull  = document.getElementById('collections-list-pull');
     const $collListMsg   = document.getElementById('collections-list-msg');
     const $collGrid      = document.getElementById('official-collections-grid');
     const $collSearch    = document.getElementById('coll-search');
@@ -1735,6 +1746,7 @@
     const $collDeselAll  = document.getElementById('coll-deselect-all');
     const _officialChecked = new Set();
     let _collListBaseline = '';
+    let _collPullReqId = null;
 
     function _renderCollGrid(filter) {
       const q = (filter || '').toLowerCase();
@@ -1813,29 +1825,51 @@
     if ($collCustom) $collCustom.addEventListener('input', _collListMarkDirty);
     _renderCollGrid('');
     _loadCollectionsList();
+    async function _saveCollectionsList(content) {
+      const res = await fetch('/api/collections-list', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
+      });
+      const result = await res.json();
+      if (!res.ok || !result.ok) throw new Error(result.error || `HTTP ${res.status}`);
+      _collListBaseline = content;
+      _collListMarkDirty();
+    }
     if ($collListSave) {
       $collListSave.onclick = async () => {
         $collListSave.disabled = true; $collListSave.style.opacity = 0.6;
         $collListMsg.textContent = 'Saving\u2026';
         const content = _buildCollListContent();
         try {
-          const res = await fetch('/api/collections-list', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content }),
-          });
-          const j = await res.json();
-          if (j.ok) {
-            _collListBaseline = content;
-            $collListMsg.textContent = 'Saved. Click \u201cUpdate & Refresh\u201d to pull the updated list.';
-            setTimeout(() => { $collListMsg.textContent = ''; }, 5000);
-          } else {
-            $collListMsg.textContent = `Error: ${j.error || 'unknown'}`;
-          }
+          await _saveCollectionsList(content);
+          $collListMsg.textContent = 'Saved.';
+          setTimeout(() => { if (!_collPullReqId) $collListMsg.textContent = ''; }, 3000);
         } catch (e) {
           $collListMsg.textContent = `Error: ${e}`;
         }
         _collListMarkDirty();
+      };
+    }
+    if ($collListPull) {
+      $collListPull.onclick = async () => {
+        $collListPull.disabled = true;
+        $collListMsg.textContent = 'Saving list...';
+        try {
+          await _saveCollectionsList(_buildCollListContent());
+          if (!client || !client.connected) throw new Error('MQTT is not connected');
+          _collPullReqId = Date.now();
+          $collListMsg.textContent = 'Fetching list...';
+          client.publish(
+            `${TOPIC_CMD_PREFIX}/settings/pull_collections`,
+            JSON.stringify({ req_id: _collPullReqId }),
+            { qos: 1, retain: false }
+          );
+        } catch (e) {
+          _collPullReqId = null;
+          $collListPull.disabled = false;
+          $collListMsg.textContent = `Error: ${e.message || e}`;
+        }
       };
     }
     _updateSettingsBtnState = function(blocked, notInArtMode) {
