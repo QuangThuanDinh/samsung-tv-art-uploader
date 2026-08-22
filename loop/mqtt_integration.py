@@ -541,11 +541,19 @@ class MQTTIntegrationMixin:
             except Exception:
                 self._mqtt.publish(self.mqtt_state_topic, display or "", qos=0, retain=True)
             attrs = {"file": file or "", "collection": collection or ""}
+            attrs["art_mode_state"] = (
+                "unknown"
+                if self._in_art_mode is None
+                else ("on" if self._in_art_mode else "off")
+            )
             # Only include in_art_mode when we actually know.  Writing False
             # while the state is still None (unknown) retains a stale 'Not in
             # art mode' for the web UI until the next confirmed-True transition.
             if self._in_art_mode is not None:
                 attrs["in_art_mode"] = bool(self._in_art_mode)
+            tv_powered_on = getattr(self, '_tv_powered_on', None)
+            if tv_powered_on is not None:
+                attrs["tv_power_on"] = bool(tv_powered_on)
             # Merge CSV columns (ensure every header key exists, even if blank)
             if self._csv_headers:
                 path_key = f"{collection}/{file}" if collection and file else None
@@ -712,6 +720,10 @@ class MQTTIntegrationMixin:
                 self.slideshow_override_pending = bool(
                     self.slideshow_override and data.get('pending', False)
                 )
+                self.slideshow_override_force_reupload = bool(
+                    self.slideshow_override_pending
+                    and data.get('force_reupload', False)
+                )
                 if self.slideshow_override:
                     self.log.info(
                         'Loaded slideshow override with %d paths (pending=%s)',
@@ -722,6 +734,7 @@ class MQTTIntegrationMixin:
             self.log.warning('Failed to load slideshow override: %s', e)
             self.slideshow_override = None
             self.slideshow_override_pending = False
+            self.slideshow_override_force_reupload = False
 
     def _save_slideshow_override(self):
         """Persist slideshow override to /data/slideshow_override.json."""
@@ -731,6 +744,11 @@ class MQTTIntegrationMixin:
                 'paths': list(self.slideshow_override) if self.slideshow_override else [],
                 'pending': bool(
                     self.slideshow_override and self.slideshow_override_pending
+                ),
+                'force_reupload': bool(
+                    self.slideshow_override
+                    and self.slideshow_override_pending
+                    and self.slideshow_override_force_reupload
                 ),
             }
             with open(self.slideshow_override_path, 'w', encoding='utf-8') as f:
@@ -926,9 +944,54 @@ class MQTTIntegrationMixin:
             desired_matte = (
                 self._resolve_matte_for(path, os.path.basename(path)) or 'none'
             )
-            if not uploaded or uploaded.get('matte') != desired_matte:
+            signature = self._get_file_signature(os.path.join(self.media_root, path))
+            modified = None
+            try:
+                modified = self.get_last_updated(
+                    os.path.basename(path),
+                    os.path.join(self.media_root, path),
+                )
+            except OSError:
+                pass
+            legacy_changed = (
+                uploaded
+                and not uploaded.get('sha256')
+                and (
+                    uploaded.get('modified') is None
+                    or modified is None
+                    or uploaded.get('modified') != modified
+                )
+            )
+            if (
+                not uploaded
+                or uploaded.get('matte') != desired_matte
+                or legacy_changed
+                or (
+                    uploaded.get('sha256')
+                    and signature.get('sha256')
+                    and uploaded['sha256'] != signature['sha256']
+                )
+            ):
                 requiring_upload.append(path)
         return requiring_upload
+
+    async def _cached_upload_matches_tv(self, path, record, live_by_id):
+        """Confirm a cached ID still refers to the same TV upload."""
+        content_id = record.get('content_id')
+        live_entry = live_by_id.get(content_id)
+        if not content_id or not live_entry:
+            return False
+        cached_date = record.get('image_date')
+        live_date = live_entry.get('image_date')
+        if cached_date is not None and live_date is not None:
+            return cached_date == live_date
+        matched = await self.pil.matches_file(
+            content_id,
+            os.path.join(self.media_root, path),
+        )
+        if matched and live_date is not None:
+            record['image_date'] = live_date
+        return matched is True
 
     def _publish_slideshow_available(self, override_collections=None, wait_for_publish=True):
         """Scan selected collections on disk and publish full image list to MQTT.
@@ -1004,17 +1067,40 @@ class MQTTIntegrationMixin:
         except Exception as e:
             self.log.warning('MQTT slideshow available publish failed: %s', e)
 
-    async def _apply_slideshow_override(self, paths, req_id=None, new_collections=None, max_uploads=None):
+    async def _apply_slideshow_override(
+        self,
+        paths,
+        req_id=None,
+        new_collections=None,
+        max_uploads=None,
+        force_reupload=False,
+        ack_cmd='slideshow/override/set',
+    ):
         """Apply a specific image selection to the TV.
-        If all requested images are already uploaded: simply restricts which play (lightweight).
-        If any images need uploading: performs a full clean reseed with the specified paths.
+        Normal applies retain matching cached uploads and change only missing,
+        modified, re-matted, or deselected uploader-managed images. Forced
+        applies delete all TV user uploads except standby and upload every path.
         When max_uploads is provided, persists the new limit to overrides.env.
         """
         def ack(status, msg):
-            self._publish_ack('slideshow/override/set', status, msg, req_id)
+            self._publish_ack(ack_cmd, status, msg, req_id)
 
-        needs_cleanup = False
+        async with self._tv_state_lock:
+            if self._refresh_in_progress or self._collections_sync_running:
+                ack('error', 'Another upload or refresh is already running')
+                return
+            self._refresh_in_progress = True
+        work_started = True
         try:
+            missing_local = [
+                path for path in paths
+                if not os.path.isfile(os.path.join(self.media_root, path))
+            ]
+            if missing_local:
+                raise RuntimeError(
+                    f'{len(missing_local)} selected image(s) no longer exist locally'
+                )
+
             if new_collections is not None:
                 # Commit the collection selection without triggering a separate full reseed.
                 # Also sync self.folder so apply_selection() sees no pending change.
@@ -1028,7 +1114,12 @@ class MQTTIntegrationMixin:
                 self.log.info('Collections committed atomically with override: %s', new_collections)
 
             # Optionally update max_uploads (user manually exceeded the limit)
-            if max_uploads is not None and isinstance(max_uploads, int) and max_uploads > 0:
+            if (
+                max_uploads is not None
+                and isinstance(max_uploads, int)
+                and max_uploads > 0
+                and max_uploads != self.max_uploads
+            ):
                 self.max_uploads = max_uploads
                 os.environ['SAMSUNG_TV_ART_MAX_UPLOADS'] = str(max_uploads)
                 self._write_overrides({'SAMSUNG_TV_ART_MAX_UPLOADS': str(max_uploads)})
@@ -1038,13 +1129,14 @@ class MQTTIntegrationMixin:
             # override is retried automatically when Art Mode becomes available.
             self.slideshow_override = list(paths)
             self.slideshow_override_pending = True
+            self.slideshow_override_force_reupload = force_reupload
             self.shown_content_ids = set()
             self._last_slideshow_paths = set(paths)
             self._save_slideshow_override()
             self._prepare_dynamic_standby(preferred_paths=paths)
             self._publish_slideshow_state()
 
-            if self.tv is None or not await self.safe_in_artmode():
+            if self.tv is None or not await self.safe_in_artmode(allow_during_refresh=True):
                 self.log.info(
                     'Saved slideshow override with %d image(s); TV upload is pending',
                     len(paths),
@@ -1052,70 +1144,140 @@ class MQTTIntegrationMixin:
                 ack('ok', f'Saved {len(paths)} image(s); upload will start when the TV enters Art Mode')
                 return
 
-            to_upload = self._slideshow_paths_requiring_upload(paths)
-            uploaded_by_path = {
-                record.get('path_rel', key): record
-                for key, record in self.uploaded_files.items()
+            live_entries = await self.get_tv_content_entries('MY-C0002')
+            if live_entries is None:
+                raise RuntimeError('Unable to verify existing TV uploads')
+            live_by_id = {
+                entry.get('content_id'): entry
+                for entry in live_entries
+                if isinstance(entry, dict) and entry.get('content_id')
             }
-            for path in to_upload:
-                uploaded = uploaded_by_path.get(path)
-                if uploaded:
-                    self.log.info(
-                        'Slideshow image requires re-upload for matte change: '
-                        '%s cached=%s desired=%s',
-                        path,
-                        uploaded.get('matte', '<unknown>'),
-                        self._resolve_matte_for(path, os.path.basename(path)) or 'none',
-                    )
-            needs_cleanup = bool(to_upload)
 
-            if needs_cleanup:
-                # Full clean reseed with exactly the specified paths
-                self._refresh_in_progress = True
+            if force_reupload:
                 self._publish_slideshow_state()
-                ack('progress', 'Preparing TV — switching to standby...')
+                ack('progress', 'Preparing TV for full re-upload...')
                 await self.ensure_standby_selected(preferred_paths=paths)
-                if self.standby_content_id:
-                    try:
-                        await self.tv.select_image(self.standby_content_id)
-                        self._publish_mqtt_state('Standby', 'standby.png', None)
-                    except Exception as e:
-                        self.log.warning('Failed to select standby: %s', e)
-                        self.standby_content_id = None
-
-                # Snapshot current uploads so the next shuffle prefers fresh images
-                self._last_slideshow_paths = {
-                    v.get('path_rel') for v in self.uploaded_files.values() if v.get('path_rel')
+                if not self.standby_content_id:
+                    raise RuntimeError('Standby image is unavailable; full re-upload cancelled')
+                await self.tv.select_image(self.standby_content_id)
+                self._publish_mqtt_state('Standby', 'standby.png', None)
+                ack('progress', 'Removing all user-uploaded images from TV...')
+                if not await self.cleanup_old_uploads(protect_current=False):
+                    raise RuntimeError('Unable to remove existing TV uploads')
+                # Once destructive cleanup succeeds, an interrupted upload can
+                # recover incrementally without deleting successful retries.
+                self.slideshow_override_force_reupload = False
+                self._save_slideshow_override()
+                to_upload = list(paths)
+            else:
+                desired_paths = set(paths)
+                cached_by_path = {
+                    record.get('path_rel', key): (key, record)
+                    for key, record in self.uploaded_files.items()
                 }
+                to_upload = self._slideshow_paths_requiring_upload(paths)
+                to_upload_set = set(to_upload)
+                delete_records = []
+                stale_keys = []
+                cache_metadata_changed = False
 
-                _existing = len([k for k in self.uploaded_files if k not in self.exclude and k != (os.path.basename(self.standby) if self.standby else None)])
-                ack('progress', f'Removing {_existing} old upload(s) from TV...' if _existing else 'Removing old uploads from TV...')
-                await self.cleanup_old_uploads()
+                for path, (key, record) in cached_by_path.items():
+                    content_id = record.get('content_id')
+                    if not await self._cached_upload_matches_tv(
+                        path,
+                        record,
+                        live_by_id,
+                    ):
+                        stale_keys.append(key)
+                        if path in desired_paths and path not in to_upload_set:
+                            to_upload.append(path)
+                            to_upload_set.add(path)
+                    elif path not in desired_paths or path in to_upload_set:
+                        delete_records.append((key, path, content_id))
+                    elif not record.get('sha256'):
+                        signature = self._get_file_signature(
+                            os.path.join(self.media_root, path)
+                        )
+                        if signature:
+                            record.update(signature)
+                            try:
+                                record['modified'] = self.get_last_updated(
+                                    os.path.basename(path),
+                                    os.path.join(self.media_root, path),
+                                )
+                            except OSError:
+                                pass
+                            cache_metadata_changed = True
 
-                if self.standby_content_id:
-                    try:
-                        await self.tv.select_image(self.standby_content_id)
-                    except Exception:
-                        pass
+                for key in stale_keys:
+                    self.uploaded_files.pop(key, None)
 
-                ack('progress', f'Uploading {len(paths)} image(s)...')
-                await self.upload_files(paths)
+                if delete_records or to_upload:
+                    self._publish_slideshow_state()
+
+                if delete_records:
+                    ack('progress', f'Removing {len(delete_records)} changed or unselected image(s)...')
+                    await self.ensure_standby_selected(preferred_paths=paths)
+                    if not self.standby_content_id:
+                        raise RuntimeError('Standby image is unavailable; selective update cancelled')
+                    await self.tv.select_image(self.standby_content_id)
+                    self._publish_mqtt_state('Standby', 'standby.png', None)
+                    for key, path, content_id in delete_records:
+                        await self.tv.delete_list([content_id])
+                        self.uploaded_files.pop(key, None)
+                        self.write_program_data()
+                        self.log.info('Removed cached TV upload: %s (%s)', path, content_id)
+                        await asyncio.sleep(self.delete_delay_seconds)
+                    await asyncio.sleep(self.post_delete_recovery_seconds)
+                elif stale_keys or cache_metadata_changed:
+                    self.write_program_data()
+
+            if to_upload:
+                ack('progress', f'Uploading {len(to_upload)} missing or changed image(s)...')
+                await self.upload_files(to_upload)
                 await asyncio.sleep(2)
 
+            remaining = self._slideshow_paths_requiring_upload(paths)
+            if remaining:
+                should_retry = not await self.safe_in_artmode(allow_during_refresh=True)
+                self.slideshow_override_pending = should_retry
+                if not should_retry:
+                    self.slideshow_override_force_reupload = False
+                self._save_slideshow_override()
+                self._publish_slideshow_state()
+                if self.get_content_ids():
+                    await self.change_art()
+                    self.start = time.time()
+                    self.write_program_data()
+                ack(
+                    'error',
+                    (
+                        f'Upload paused — {len(remaining)} image(s) remain and will resume in Art Mode'
+                        if should_retry
+                        else f'Upload incomplete — {len(remaining)} image(s) failed; use Apply to retry'
+                    ),
+                )
+                return
+
             self.slideshow_override_pending = False
+            self.slideshow_override_force_reupload = False
             self._save_slideshow_override()
             self._publish_slideshow_state()
             await self.change_art()
-            if needs_cleanup:
+            if work_started:
                 self.start = time.time()
-                self.write_program_data()  # persists _last_slideshow_paths via cache
+                self.write_program_data()
             ack('ok', f'Applied {len(paths)} image(s)')
         except Exception as e:
             self.log.warning('Error applying selection: %s', e)
+            should_retry = self.tv is not None and not await self.safe_in_artmode(allow_during_refresh=True)
+            self.slideshow_override_pending = should_retry
+            if not should_retry:
+                self.slideshow_override_force_reupload = False
+            self._save_slideshow_override()
             ack('error', str(e))
-            raise
         finally:
-            if needs_cleanup:
+            if work_started:
                 self._refresh_in_progress = False
                 self._publish_slideshow_state()
                 self._publish_slideshow_available()
@@ -1507,10 +1669,9 @@ class MQTTIntegrationMixin:
                     self._publish_ack('artwork/set', 'error', f'File not found: {rel_path}', req_id)
                     return
                 # Upload (if needed) and select immediately
-                base_name = os.path.basename(rel_path)
                 awaitable = self.upload_files([rel_path])
                 # Ensure the coroutine is executed in loop-safe way
-                fut = self._schedule_command_coro(self._post_upload_select(awaitable, base_name, req_id), 'artwork/set')
+                fut = self._schedule_command_coro(self._post_upload_select(awaitable, rel_path, req_id), 'artwork/set')
                 if not fut:
                     self._publish_ack('artwork/set', 'error', 'Failed to queue artwork upload/select', req_id)
                 return
@@ -1610,12 +1771,12 @@ class MQTTIntegrationMixin:
                 self._publish_settings_state()
                 self._publish_ack('slideshow/settings/set', 'ok', 'Slideshow settings updated', req_id)
                 return
-            if cmd == 'slideshow/override/set':
+            if cmd in ('slideshow/override/set', 'slideshow/override/reupload'):
                 paths = []
                 if data and 'paths' in data and isinstance(data['paths'], list):
                     paths = [str(p).strip() for p in data['paths'] if str(p).strip()]
                 if not paths:
-                    self._publish_ack('slideshow/override/set', 'error', 'No paths provided', req_id)
+                    self._publish_ack(cmd, 'error', 'No paths provided', req_id)
                     return
                 # Optional 'collections' field: commit collection changes atomically with override.
                 new_cols = None
@@ -1629,9 +1790,20 @@ class MQTTIntegrationMixin:
                         new_max = int(data['max_uploads'])
                     except (ValueError, TypeError):
                         new_max = None
-                fut = self._schedule_command_coro(self._apply_slideshow_override(paths, req_id, new_collections=new_cols, max_uploads=new_max), 'slideshow/override/set')
+                force_reupload = cmd == 'slideshow/override/reupload'
+                fut = self._schedule_command_coro(
+                    self._apply_slideshow_override(
+                        paths,
+                        req_id,
+                        new_collections=new_cols,
+                        max_uploads=new_max,
+                        force_reupload=force_reupload,
+                        ack_cmd=cmd,
+                    ),
+                    cmd,
+                )
                 if not fut:
-                    self._publish_ack('slideshow/override/set', 'error', 'Failed to queue override apply', req_id)
+                    self._publish_ack(cmd, 'error', 'Failed to queue slideshow update', req_id)
                 return
             if cmd == 'slideshow/presets/set':
                 # Clients publish their full presets array here; backend persists it
@@ -1682,6 +1854,7 @@ class MQTTIntegrationMixin:
             if cmd == 'slideshow/override/clear':
                 self.slideshow_override = None
                 self.slideshow_override_pending = False
+                self.slideshow_override_force_reupload = False
                 self._save_slideshow_override()
                 self.shown_content_ids = set()
                 self._publish_slideshow_state()
@@ -1731,6 +1904,18 @@ class MQTTIntegrationMixin:
                         self._publish_ack('slideshow/matte/apply', 'error', 'Missing path', req_id)
                         return
                     async def _apply_reupload():
+                        async with self._tv_state_lock:
+                            if self._refresh_in_progress or self._collections_sync_running:
+                                self._publish_ack(
+                                    'slideshow/matte/apply',
+                                    'error',
+                                    'Another upload or refresh is already running',
+                                    req_id,
+                                    extra={'path': path},
+                                )
+                                return
+                            self._refresh_in_progress = True
+                        self._publish_slideshow_state()
                         try:
                             new_id, effective = await self._apply_matte_via_reupload(path)
                             self._publish_ack(
@@ -1747,6 +1932,9 @@ class MQTTIntegrationMixin:
                         except Exception as ex:
                             self.log.warning('matte/apply failed for %s: %s', path, ex)
                             self._publish_ack('slideshow/matte/apply', 'error', str(ex), req_id, extra={'path': path})
+                        finally:
+                            self._refresh_in_progress = False
+                            self._publish_slideshow_state()
                     self._schedule_command_coro(_apply_reupload(), 'slideshow/matte/apply')
                 except Exception as e:
                     self._publish_ack('slideshow/matte/apply', 'error', str(e), req_id)
@@ -1884,7 +2072,7 @@ class MQTTIntegrationMixin:
     async def _do_pull_collections(self, req_id=None):
         """Update local collection repositories and metadata without touching the TV."""
         ack_cmd = 'settings/pull_collections'
-        if self._collections_sync_running:
+        if self._collections_sync_running or self._refresh_in_progress:
             self.log.info('%s ignored: collection update already running', ack_cmd)
             self._publish_ack(ack_cmd, 'error', 'Collection update already running', req_id)
             return
@@ -1903,7 +2091,7 @@ class MQTTIntegrationMixin:
     async def _do_sync_collections(self, req_id=None):
         """Fetch git repos → rebuild CSV → reload metadata → reseed TV."""
         ack_cmd = 'collections/refresh'
-        if self._collections_sync_running:
+        if self._collections_sync_running or self._refresh_in_progress:
             self.log.info('settings/sync_collections ignored: already running')
             self._publish_ack(ack_cmd, 'error', 'Update already running', req_id)
             return
@@ -1926,21 +2114,33 @@ class MQTTIntegrationMixin:
         finally:
             self._collections_sync_running = False
 
-    async def _post_upload_select(self, upload_coro, base_name, req_id):
+    async def _post_upload_select(self, upload_coro, rel_path, req_id):
+        async with self._tv_state_lock:
+            if self._refresh_in_progress or self._collections_sync_running:
+                upload_coro.close()
+                self._publish_ack(
+                    'artwork/set',
+                    'error',
+                    'Another upload or refresh is already running',
+                    req_id,
+                )
+                return
+            self._refresh_in_progress = True
+        self._publish_slideshow_state()
         try:
             await upload_coro
             # Select the just-uploaded image
-            content_id = None
-            for k, v in self.uploaded_files.items():
-                if k == base_name:
-                    content_id = v.get('content_id')
-                    break
+            record = self.uploaded_files.get(rel_path)
+            content_id = record.get('content_id') if record else None
             if content_id:
                 await self.tv.select_image(content_id)
                 self.current_content_id = content_id
                 await self.update_ha_selected_artwork(content_id)
-                self._publish_ack('artwork/set', 'ok', f'Selected {base_name}', req_id)
+                self._publish_ack('artwork/set', 'ok', f'Selected {os.path.basename(rel_path)}', req_id)
             else:
-                self._publish_ack('artwork/set', 'error', f'Upload failed for {base_name}', req_id)
+                self._publish_ack('artwork/set', 'error', f'Upload failed for {os.path.basename(rel_path)}', req_id)
         except Exception as e:
             self._publish_ack('artwork/set', 'error', f'Exception selecting: {e}', req_id)
+        finally:
+            self._refresh_in_progress = False
+            self._publish_slideshow_state()

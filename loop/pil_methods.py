@@ -147,6 +147,22 @@ class PIL_methods:
                     self.log.warning('failed to fetch thumbnail list (%s) — skipping thumbnail sync', e)
         self.log.info('got {} thumbnails'.format(len(thumbnails)))
         return thumbnails
+
+    async def matches_file(self, content_id, path):
+        """Return True/False when a TV thumbnail can be compared, otherwise None."""
+        if not HAVE_PIL or not os.path.isfile(path):
+            return None
+        thumbnails = await self.get_thumbnails([content_id])
+        thumbnail = thumbnails.get(content_id)
+        if not thumbnail:
+            return None
+        try:
+            with Image.open(io.BytesIO(thumbnail)) as tv_image:
+                with Image.open(path) as local_image:
+                    return self.are_images_equal(tv_image, local_image)
+        except Exception as e:
+            self.log.warning('failed to compare thumbnail %s with %s: %s', content_id, path, e)
+            return None
         
     def fix_file_type(self, filename, file_type, image_data=None):
         if not all([HAVE_PIL, file_type]):

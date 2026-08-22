@@ -60,6 +60,7 @@ import time
 import datetime
 import argparse
 import csv
+import hashlib
 import unicodedata
 from signal import SIGTERM, SIGINT
 from .standy_util import refresh_dynamic_standby
@@ -268,11 +269,15 @@ class monitor_and_display(MQTTIntegrationMixin):
         self._refresh_in_progress = False
         self._startup_in_progress = False  # True between MQTT init and end of initialize()
         self._in_art_mode = None           # None = unknown, True/False = last known state
+        self._tv_powered_on = None         # None = unknown; updated only from REST or power events
         self._last_slideshow_paths = set() # path_rel values from the previous seed, used to avoid re-picking the same images
         self._loop = None
         self._collections_sync_running = False
         self._artmode_event = None         # asyncio.Event set when TV signals an art mode change
         self._not_in_artmode_logged = False    # suppress repeated 'not in art mode' messages
+        self._tv_shutdown_signaled = False
+        self._tv_off_confirmed = False
+        self._tv_state_lock = asyncio.Lock()
         try:
             #doesn't work in Windows
             asyncio.get_running_loop().add_signal_handler(SIGINT, self.close)
@@ -349,7 +354,20 @@ class monitor_and_display(MQTTIntegrationMixin):
             artmode_event=self._artmode_event,
             logger=self.log,
             reconnect_delay=self.reconnect_delay,
+            power_state_callback=self._handle_tv_power_signal,
         )
+
+    def _handle_tv_power_signal(self, state):
+        if state == 'standby':
+            self._tv_shutdown_signaled = True
+            self._tv_off_confirmed = False
+            self._tv_powered_on = False
+            self._in_art_mode = False
+            self._publish_mqtt_state('TV Power Off', 'power_off', None)
+        elif state == 'wakeup':
+            # A wake event proves the shutdown transition completed. The old
+            # connection remains retired and will be replaced after REST is on.
+            self._tv_off_confirmed = True
         
     async def start_monitoring(self):
         '''
@@ -375,6 +393,7 @@ class monitor_and_display(MQTTIntegrationMixin):
         self._load_slideshow_override()
         self._load_slideshow_presets()
         self._load_matte_overrides()
+        self._restore_cached_selection()
         self._prepare_dynamic_standby()
         # Init MQTT if enabled
         if self.mqtt_enabled:
@@ -418,8 +437,12 @@ class monitor_and_display(MQTTIntegrationMixin):
                     connect_timeout = 120 if needs_pairing else 15
                     if needs_pairing:
                         self.log.info('No saved token — connecting (up to %ds); the TV may show a one-time pairing prompt', connect_timeout)
-                    await asyncio.wait_for(self.tv.start_listening(), timeout=connect_timeout)
-                    self.log.info('Started')
+                    if await self.tv.is_powered_on():
+                        await asyncio.wait_for(self.tv.start_listening(), timeout=connect_timeout)
+                        self.log.info('Started')
+                    else:
+                        self.log.info('TV is powered off; waiting via REST before opening Art WebSocket')
+                        self.tv.retire()
                 except asyncio.TimeoutError:
                     self.log.warning('TV connection timed out at startup — will retry in main loop')
                 except Exception as e:
@@ -434,7 +457,6 @@ class monitor_and_display(MQTTIntegrationMixin):
                         await self.get_api_version()
                         await self.check_matte()
                         await self.ensure_standby_selected()
-                        await self.cleanup_old_uploads()
                     except Exception as e:
                         self.log.warning('Startup TV setup error (non-fatal): %s', e)
             # Always run select_artwork — even if TV is not reachable right now,
@@ -487,28 +509,87 @@ class monitor_and_display(MQTTIntegrationMixin):
                     return False
                 await asyncio.sleep(1)
 
-    async def reconnect_tv(self):
-        """Gracefully reconnect to the TV websocket."""
-        # If TV connection object was never created (e.g. TV unreachable at startup),
-        # try to create it now before attempting start_listening.
-        if self.tv is None:
+    async def reconnect_tv(self, power_verified=False):
+        """Replace a dropped Art client; never reopen the old WebSocket object."""
+        old_tv = self.tv
+        if old_tv is not None:
+            old_tv.retire()
             try:
-                self._create_tv_connection()
-            except Exception as e:
-                self.log.debug('TV still unavailable during reconnect: %s', e)
+                await old_tv.close()
+            except Exception:
+                pass
+        self.tv = None
+        try:
+            self._create_tv_connection()
+            if not power_verified and not await self.tv.is_powered_on():
+                self.tv.retire()
                 return False
-        return await self.tv.reconnect()
+            await asyncio.wait_for(self.tv.start_listening(), timeout=15)
+            if self.tv.is_alive():
+                self.log.info('Connected to TV with a fresh WebSocket client')
+                return True
+        except Exception as e:
+            self.log.debug('Fresh TV connection failed: %s', e)
+        if self.tv is not None:
+            self.tv.retire()
+        return False
 
-    async def safe_in_artmode(self):
+    async def safe_in_artmode(self, allow_during_refresh=False):
+        async with self._tv_state_lock:
+            return await self._safe_in_artmode_unlocked(allow_during_refresh)
+
+    async def _safe_in_artmode_unlocked(self, allow_during_refresh=False):
         """Return True if TV reports art mode; False on any error. Uses exponential backoff."""
         try:
             self.last_artmode_check = time.time()
-            in_artmode = await self.tv.query_artmode()
+            if self.tv is None:
+                self._create_tv_connection()
+            try:
+                powered_on = await self.tv.is_powered_on()
+            except Exception as e:
+                self.log.debug('TV REST power probe failed: %s', e)
+                powered_on = False
+
+            if not powered_on:
+                self._tv_off_confirmed = True
+                self.tv.retire()
+                prev = self._in_art_mode
+                power_was_on = self._tv_powered_on is not False
+                self._tv_powered_on = False
+                self._in_art_mode = False
+                self.consecutive_failures = 0
+                if prev is True or power_was_on:
+                    self._publish_mqtt_state('TV Power Off', 'power_off', None)
+                return False
+
+            if self._tv_shutdown_signaled and not self._tv_off_confirmed:
+                # The TV may report REST power=on briefly while shutting down.
+                # Wait until off is observed (or a wakeup event arrives) before
+                # creating any replacement Art WebSocket.
+                self._tv_powered_on = False
+                self._in_art_mode = False
+                return False
+
+            if self._refresh_in_progress and not allow_during_refresh:
+                return False
+
+            if self._tv_shutdown_signaled:
+                self._tv_shutdown_signaled = False
+            self._tv_off_confirmed = False
+            self._tv_powered_on = True
+
+            if self.tv.retired or not self.tv.is_alive():
+                if not await self.reconnect_tv(power_verified=True):
+                    self._in_art_mode = None
+                    self._publish_mqtt_state('Unknown status', 'unknown', None)
+                    return False
+
+            in_artmode = await self.tv.query_artmode(power_verified=True)
             # Success - reset failure counter
             self.consecutive_failures = 0
             prev = self._in_art_mode
             self._in_art_mode = bool(in_artmode)
-            if prev is True and not in_artmode:
+            if prev is not False and not in_artmode:
                 # TV just left art mode — publish sentinel with in_art_mode: False so UIs disable
                 self._publish_mqtt_state('Unavailable', 'unavailable', None)
             elif prev is not True and in_artmode:
@@ -523,27 +604,26 @@ class monitor_and_display(MQTTIntegrationMixin):
                 self._last_state_publish = 0
                 if not self._refresh_in_progress:
                     try:
-                        await self._publish_current_artwork_state(force=True)
+                        await self._publish_current_artwork_state(
+                            force=True,
+                            state_locked=True,
+                        )
                     except Exception:
                         pass
             return in_artmode
         except AssertionError:
             self.consecutive_failures += 1
             log_fn = self.log.warning if self.consecutive_failures == 1 else self.log.debug
-            log_fn('TV artmode check failed (empty response, failure %d); treating as off', self.consecutive_failures)
-            prev = self._in_art_mode
-            self._in_art_mode = False
-            if prev is True:
-                self._publish_mqtt_state('Unavailable', 'unavailable', None)
+            log_fn('TV artmode check failed (empty response, failure %d); status unknown', self.consecutive_failures)
+            self._in_art_mode = None
+            self._publish_mqtt_state('Unknown status', 'unknown', None)
             return False
         except Exception as e:
             self.consecutive_failures += 1
             log_fn = self.log.warning if self.consecutive_failures == 1 else self.log.debug
             log_fn('TV artmode check failed (failure %d): %s', self.consecutive_failures, e)
-            prev = self._in_art_mode
-            self._in_art_mode = False
-            if prev is True:
-                self._publish_mqtt_state('Unavailable', 'unavailable', None)
+            self._in_art_mode = None
+            self._publish_mqtt_state('Unknown status', 'unknown', None)
             return False
 
     def get_backoff_delay(self):
@@ -554,18 +634,21 @@ class monitor_and_display(MQTTIntegrationMixin):
         delay = min(1 * (2 ** (self.consecutive_failures - 1)), self.max_backoff_seconds)
         return delay
 
-    async def cleanup_old_uploads(self):
+    async def cleanup_old_uploads(self, protect_current=True):
         """Delete previously uploaded photos from the TV in small batches to avoid overwhelming it."""
         try:
-            if not await self.safe_in_artmode():
+            if not await self.safe_in_artmode(allow_during_refresh=True):
                 self.log.info('TV not in art mode, skipping cleanup')
-                return
+                return False
 
             # Protect the currently-displayed image from deletion even if standby
             # selection hasn't taken effect yet (e.g. slow TV or stale content_id).
-            currently_displayed = await self.get_current_artwork()
+            currently_displayed = await self.get_current_artwork() if protect_current else None
 
             my_photos = await self.get_tv_content('MY-C0002')
+            if my_photos is None:
+                self.log.warning('Cleanup aborted: unable to list TV uploads')
+                return False
             if my_photos:
                 skip = {cid for cid in (self.standby_content_id, currently_displayed) if cid}
                 my_photos = [cid for cid in my_photos if cid not in skip]
@@ -599,8 +682,10 @@ class monitor_and_display(MQTTIntegrationMixin):
             # every restart.
             if self.standby_content_id:
                 self._cache_standby_content_id(self.standby_content_id, self.standby_image_date)
+            return True
         except Exception as e:
             self.log.warning('Failed to cleanup uploads: %s', e)
+            return False
 
     def _prepare_dynamic_standby(self, preferred_paths=None):
         """Delegate local standby generation and invalidate stale TV cache state."""
@@ -766,6 +851,29 @@ class monitor_and_display(MQTTIntegrationMixin):
         except Exception:
             return []
 
+    def _restore_cached_selection(self):
+        """Restore the prior selection before retained MQTT state is delivered."""
+        cached = self._read_cached_selected_collections()
+        if not cached:
+            return
+        try:
+            available = set(self._scan_collections())
+            mapped = []
+            for collection in cached:
+                resolved = self._map_to_artwork_dir(collection) or collection
+                if resolved in available and resolved not in mapped:
+                    mapped.append(resolved)
+            if not mapped:
+                return
+            self.selected_collections = mapped
+            desired = self.get_selected_folder()
+            if os.path.isdir(desired):
+                self.folder = desired
+            self.set_current_cache()
+            self.log.info('Restored cached collection selection: %s', mapped)
+        except Exception as e:
+            self.log.warning('Failed to restore cached collection selection: %s', e)
+
     def save_cache(self):
         try:
             with open(self.cache_path, 'w') as f:
@@ -777,7 +885,11 @@ class monitor_and_display(MQTTIntegrationMixin):
         self.load_cache()
         self.current_key = self.get_cache_key(self.folder)
         data = self.cache.get(self.current_key, {})
-        self.uploaded_files = data.get('uploaded_files', {})
+        loaded_files = data.get('uploaded_files', {})
+        self.uploaded_files = {
+            record.get('path_rel') or key: record
+            for key, record in loaded_files.items()
+        }
         self.start = data.get('last_update', time.time())
         # Restore last slideshow paths so the next seed avoids repeating the same images.
         # Fall back to deriving them from uploaded_files (backward compat with old cache).
@@ -1002,7 +1114,11 @@ class monitor_and_display(MQTTIntegrationMixin):
                     mapped = sorted(list(have))
                 if mapped:
                     self.selected_collections = mapped
-                    self._pending_selection_change = True
+                    desired = self.get_selected_folder()
+                    if os.path.isdir(desired):
+                        self.folder = desired
+                    self.set_current_cache()
+                    self._pending_selection_change = False
                     # Reflect fallback selection on the shared state so UIs stay consistent
                     try:
                         self._publish_selected_collections_state()
@@ -1307,28 +1423,68 @@ class monitor_and_display(MQTTIntegrationMixin):
                 pass
             await asyncio.sleep(max(5, int(getattr(self, 'memlog_seconds', 60))))
             
+    def _get_file_signature(self, path):
+        try:
+            digest = hashlib.sha256()
+            with open(path, 'rb') as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            return {
+                'size': os.path.getsize(path),
+                'sha256': digest.hexdigest(),
+            }
+        except OSError:
+            return {}
+
     def update_uploaded_files(self, filename, content_id, full_path=None, matte_id=None):
         '''
         if file is uploaded, update the dictionary entry
         if content_id is None, file failed to upload, so remove it from the dict
         full_path is used for multi-collection mode where filename is just basename
         '''
-        self.uploaded_files.pop(filename, None)
-        if content_id:
+        rel_path = None
+        try:
+            if full_path and self.media_root and os.path.commonpath([self.media_root, full_path]) == self.media_root:
+                rel_path = os.path.relpath(full_path, self.media_root)
+        except Exception:
             rel_path = None
-            try:
-                if full_path and self.media_root and os.path.commonpath([self.media_root, full_path]) == self.media_root:
-                    rel_path = os.path.relpath(full_path, self.media_root)
-            except Exception:
-                rel_path = None
+        cache_key = rel_path or filename
+        self.uploaded_files.pop(filename, None)
+        self.uploaded_files.pop(cache_key, None)
+        if content_id:
             record = {
                 'content_id': content_id,
                 'modified': self.get_last_updated(filename, full_path),
                 'path_rel': rel_path or filename,
             }
+            if full_path:
+                record.update(self._get_file_signature(full_path))
             if matte_id is not None:
                 record['matte'] = matte_id or 'none'
-            self.uploaded_files[filename] = record
+            self.uploaded_files[cache_key] = record
+
+    async def _refresh_uploaded_image_dates(self, content_ids):
+        content_ids = set(content_ids)
+        if not content_ids:
+            return
+        entries = await self.get_tv_content_entries('MY-C0002')
+        if entries is None:
+            return
+        dates_by_id = {
+            entry.get('content_id'): entry.get('image_date')
+            for entry in entries
+            if isinstance(entry, dict)
+            and entry.get('content_id') in content_ids
+            and entry.get('image_date') is not None
+        }
+        changed = False
+        for record in self.uploaded_files.values():
+            image_date = dates_by_id.get(record.get('content_id'))
+            if image_date is not None and record.get('image_date') != image_date:
+                record['image_date'] = image_date
+                changed = True
+        if changed:
+            self.write_program_data()
         
     async def upload_files(self, filenames, progress_cb=None):
         '''
@@ -1339,6 +1495,8 @@ class monitor_and_display(MQTTIntegrationMixin):
         upload_delay = self.upload_delay_seconds  # seconds between uploads
         consecutive_failures = 0
         max_consecutive_failures = 3
+        uploaded_count = 0
+        uploaded_content_ids = []
         
         for idx, filename in enumerate(filenames):
             # Handle both simple filenames and relative paths from multi-collection mode
@@ -1366,7 +1524,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 continue
                 
             file_data, file_type = self.read_file(path)
-            if file_data and self.tv.art_mode:
+            if file_data:
                 self.log.info('uploading : {} to tv ({}/{})'.format(display_name, idx + 1, len(filenames)))
                 if progress_cb:
                     try:
@@ -1445,8 +1603,6 @@ class monitor_and_display(MQTTIntegrationMixin):
                     # Skip to next file after reconnect
                     continue
                     
-                # Use basename for uploaded_files tracking (consistent with single-folder mode)
-                # Pass full path for get_last_updated in multi-collection mode
                 base_name = os.path.basename(filename)
                 self.update_uploaded_files(
                     base_name,
@@ -1454,14 +1610,19 @@ class monitor_and_display(MQTTIntegrationMixin):
                     full_path=path,
                     matte_id=matte_for_upload,
                 )
-                if self.uploaded_files.get(base_name, {}).get('content_id'):
-                    self.log.info('uploaded : {} to tv as {}'.format(display_name, self.uploaded_files[base_name]['content_id']))
+                cache_key = path_rel_for_matte or base_name
+                if self.uploaded_files.get(cache_key, {}).get('content_id'):
+                    self.log.info('uploaded : {} to tv as {}'.format(display_name, self.uploaded_files[cache_key]['content_id']))
+                    uploaded_content_ids.append(self.uploaded_files[cache_key]['content_id'])
+                    uploaded_count += 1
                 else:
                     self.log.warning('file: {} failed to upload'.format(display_name))
                 self.write_program_data()
                 # Add delay between uploads to let TV process
                 if idx < len(filenames) - 1:
                     await asyncio.sleep(upload_delay)
+        await self._refresh_uploaded_image_dates(uploaded_content_ids)
+        return uploaded_count
             
     async def delete_files_from_tv(self, content_ids):
         '''
@@ -1508,8 +1669,9 @@ class monitor_and_display(MQTTIntegrationMixin):
         # Standby is always present and is not a slideshow slot, so exclude it from the count.
         standby_basename = os.path.basename(self.standby) if self.standby else None
         already_on_tv = len([
-            k for k in self.uploaded_files
-            if k not in self.exclude and k != standby_basename
+            record for key, record in self.uploaded_files.items()
+            if key not in self.exclude
+            and os.path.basename(record.get('path_rel', key)) != standby_basename
         ])
         headroom = max(0, max_uploads - already_on_tv)
         if headroom == 0:
@@ -1544,8 +1706,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 new_files = sorted(new_files)
             self.log.info('adding files to tv : {}'.format(new_files))
             await self.wait_for_files(new_files)
-            await self.upload_files(new_files, progress_cb=getattr(self, '_reseed_progress_cb', None))
-            return len(new_files)
+            return await self.upload_files(new_files, progress_cb=getattr(self, '_reseed_progress_cb', None))
         return 0
 
     async def get_files_from_multiple_collections(self, collections, max_uploads):
@@ -1615,8 +1776,11 @@ class monitor_and_display(MQTTIntegrationMixin):
                           min(deficit, len(all_stale)))
 
         # Safety filter: never re-upload something already on the TV in this session
-        already_uploaded = set(self.uploaded_files.keys())
-        selected = [f for f in selected if os.path.basename(f) not in already_uploaded]
+        already_uploaded = {
+            record.get('path_rel', key)
+            for key, record in self.uploaded_files.items()
+        }
+        selected = [f for f in selected if f not in already_uploaded]
 
         self.log.info('Total files selected for upload: %d', len(selected))
         return selected
@@ -1752,14 +1916,20 @@ class monitor_and_display(MQTTIntegrationMixin):
             # Override mode: return content_ids in override order for paths currently on the TV
             result = []
             for path in self.slideshow_override:
-                base = os.path.basename(path)
-                for rec in self.uploaded_files.values():
-                    pr = rec.get('path_rel', '')
-                    if pr == path or pr == base or os.path.basename(pr) == base:
-                        cid = rec.get('content_id')
-                        if cid and cid not in result:
-                            result.append(cid)
-                            break
+                rec = self.uploaded_files.get(path)
+                if rec is None:
+                    base = os.path.basename(path)
+                    rec = next(
+                        (
+                            candidate
+                            for key, candidate in self.uploaded_files.items()
+                            if key == base and candidate.get('path_rel', key) == base
+                        ),
+                        None,
+                    )
+                cid = rec.get('content_id') if rec else None
+                if cid and cid not in result:
+                    result.append(cid)
             return result
         if self.fav:
             # Exclude from uploaded files and fav
@@ -1817,7 +1987,7 @@ class monitor_and_display(MQTTIntegrationMixin):
             return
         # Resolve to full path and collection when possible
         base_name = os.path.basename(filename)
-        rec = self.uploaded_files.get(base_name, {})
+        rec = self.uploaded_files.get(filename) or self.uploaded_files.get(base_name, {})
         rel_path = rec.get('path_rel')
         full_path = os.path.join(self.media_root, rel_path) if rel_path else os.path.join(self.folder, base_name)
         collection = None
@@ -2034,6 +2204,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 matte_id='none',
             )
             self.write_program_data()
+            await self._refresh_uploaded_image_dates([new_content_id])
             # Restore display if we were showing the image
             if was_current:
                 try:
@@ -2055,6 +2226,7 @@ class monitor_and_display(MQTTIntegrationMixin):
             matte_id=matte,
         )
         self.write_program_data()
+        await self._refresh_uploaded_image_dates([new_content_id])
         if was_current:
             try:
                 await self.tv.select_image(new_content_id)
@@ -2071,44 +2243,54 @@ class monitor_and_display(MQTTIntegrationMixin):
         '''
         scan folder for new, deleted or updated files, but only when tv is in art mode
         '''
-        if self._refresh_in_progress:
-            return
+        deferred_action = None
         try:
-            # Refresh CSV-driven collections periodically without needing a restart
-            self._maybe_reload_csv_and_publish_collections()
-            selection_changed = self.apply_selection()
-            update_due = self.update_time > 0 and (time.time() - self.start >= self.update_time)
-            override_pending = bool(
-                self.slideshow_override_pending and self.slideshow_override
-            )
-            if self.selection_only and not selection_changed and not update_due and not override_pending:
-                return
-            artmode_due = self.artmode_refresh_seconds > 0 and (time.time() - self.last_artmode_check >= self.artmode_refresh_seconds)
-            if not selection_changed and not update_due and not artmode_due and not override_pending:
-                self.log.debug('No selection change, update due, or artmode refresh; skipping TV poll')
-                return
-            if not selection_changed and not update_due and artmode_due and not override_pending:
-                await self.safe_in_artmode()
-                return
-            if await self.safe_in_artmode():
+            async with self._tv_state_lock:
+                if self._refresh_in_progress:
+                    return
+                # Refresh CSV-driven collections periodically without needing a restart
+                self._maybe_reload_csv_and_publish_collections()
+                selection_changed = self.apply_selection()
+                update_due = self.update_time > 0 and (time.time() - self.start >= self.update_time)
+                override_pending = bool(
+                    self.slideshow_override_pending and self.slideshow_override
+                )
+                if self.selection_only and not selection_changed and not update_due and not override_pending:
+                    return
+                artmode_due = self.artmode_refresh_seconds > 0 and (time.time() - self.last_artmode_check >= self.artmode_refresh_seconds)
+                if not selection_changed and not update_due and not artmode_due and not override_pending:
+                    self.log.debug('No selection change, update due, or artmode refresh; skipping TV poll')
+                    return
+                if not selection_changed and not update_due and artmode_due and not override_pending:
+                    await self._safe_in_artmode_unlocked()
+                    return
+                if not await self._safe_in_artmode_unlocked():
+                    self.log.info('artmode or tv is off')
+                    return
                 if override_pending:
-                    self.log.info(
-                        'TV entered Art Mode; applying pending slideshow override'
-                    )
-                    await self._apply_slideshow_override(
-                        list(self.slideshow_override),
-                        req_id=f'deferred_{int(time.time() * 1000)}',
-                    )
+                    deferred_action = 'override'
                 elif selection_changed:
-                    self.log.info('selection changed, syncing directory: {}'.format(self.folder))
-                    await self._do_full_reseed()
-                # update tv art if enabled by timer
+                    deferred_action = 'reseed'
                 elif update_due:
                     await self.update_art_timer()
                 elif len(self.get_content_ids()) == 1:
                     await self.change_art()
-            else:
-                self.log.info('artmode or tv is off')
+
+            if deferred_action == 'override':
+                self.log.info('TV entered Art Mode; applying pending slideshow override')
+                await self._apply_slideshow_override(
+                    list(self.slideshow_override),
+                    req_id=f'deferred_{int(time.time() * 1000)}',
+                    force_reupload=self.slideshow_override_force_reupload,
+                    ack_cmd=(
+                        'slideshow/override/reupload'
+                        if self.slideshow_override_force_reupload
+                        else 'slideshow/override/set'
+                    ),
+                )
+            elif deferred_action == 'reseed':
+                self.log.info('selection changed, syncing directory: {}'.format(self.folder))
+                await self._do_full_reseed()
         except Exception as e:
             self.log.warning('error in check_dir, attempting reconnect: %s', e)
             await self.reconnect_tv()
@@ -2120,10 +2302,15 @@ class monitor_and_display(MQTTIntegrationMixin):
         '''
         await self.initialize()
         while True:
+            if self._refresh_in_progress:
+                await asyncio.sleep(0.25)
+                continue
             if not await self.safe_in_artmode():
-                if self.tv is None or self.consecutive_failures >= 3:
-                    await self.reconnect_tv()
-                backoff_delay = self.artmode_refresh_seconds or 1
+                backoff_delay = (
+                    max(5, int(os.environ.get('SAMSUNG_TV_ART_POWER_PROBE_SECONDS', '10')))
+                    if self._tv_off_confirmed or self._tv_shutdown_signaled
+                    else self.get_backoff_delay()
+                )
                 if not self._not_in_artmode_logged:
                     self.log.info('TV is not in art mode')
                     self._not_in_artmode_logged = True
@@ -2162,18 +2349,24 @@ class monitor_and_display(MQTTIntegrationMixin):
             else:
                 await asyncio.sleep(self.period)
 
-    async def _publish_current_artwork_state(self, force=False):
+    async def _publish_current_artwork_state(self, force=False, state_locked=False):
         """Poll current TV artwork and publish MQTT state/attributes.
         Uses uploaded_files mapping to derive filename when possible.
         """
-        if self._refresh_in_progress:
-            return
-        if not self.mqtt_enabled or not self._mqtt:
-            return
+        if not state_locked:
+            await self._tv_state_lock.acquire()
         try:
-            cid = await self.get_current_artwork()
-        except Exception:
-            cid = None
+            if self._refresh_in_progress:
+                return
+            if not self.mqtt_enabled or not self._mqtt:
+                return
+            try:
+                cid = await self.get_current_artwork()
+            except Exception:
+                cid = None
+        finally:
+            if not state_locked:
+                self._tv_state_lock.release()
         # If nothing has changed and not forced, skip
         if cid == self.current_content_id and not force:
             # Still ensure attributes are up to date periodically
@@ -2229,7 +2422,11 @@ class monitor_and_display(MQTTIntegrationMixin):
         def ack(status, msg):
             self._publish_ack('collections/refresh', status, msg, req_id)
 
-        self._refresh_in_progress = True
+        async with self._tv_state_lock:
+            if self._refresh_in_progress:
+                ack('error', 'Another upload or refresh is already running')
+                return
+            self._refresh_in_progress = True
         self._publish_slideshow_state()
         try:
             def _on_upload_progress(idx, total, name):
@@ -2256,9 +2453,15 @@ class monitor_and_display(MQTTIntegrationMixin):
             }
 
             # Count existing uploads before cleanup for the progress message
-            _existing = len([k for k in self.uploaded_files if k not in self.exclude and k != (os.path.basename(self.standby) if self.standby else None)])
+            standby_basename = os.path.basename(self.standby) if self.standby else None
+            _existing = len([
+                record for key, record in self.uploaded_files.items()
+                if key not in self.exclude
+                and os.path.basename(record.get('path_rel', key)) != standby_basename
+            ])
             ack('progress', f'Removing {_existing} old upload(s) from TV...' if _existing else 'Removing old uploads from TV...')
-            await self.cleanup_old_uploads()
+            if not await self.cleanup_old_uploads():
+                raise RuntimeError('Unable to list or remove existing TV uploads')
 
             # Re-select standby after cleanup: the TV can revert to the last playing art
             # (e.g. the previous override image) during the deletion pass, then fall back
@@ -2292,18 +2495,21 @@ class monitor_and_display(MQTTIntegrationMixin):
             self._refresh_in_progress = False
             self._publish_slideshow_state()
             self._publish_slideshow_available()
-            # Force-publish current artwork state so UIs clear any stale in_art_mode=false
-            # retained from a previous session and correctly re-enable buttons.
-            try:
-                await self._publish_current_artwork_state(force=True)
-            except Exception:
-                pass
 
     async def _do_collections_refresh(self, req_id=None):
         """MQTT-triggered refresh: clears slideshow override then reseeds."""
+        if self._refresh_in_progress or self._collections_sync_running:
+            self._publish_ack(
+                'collections/refresh',
+                'error',
+                'Another upload or refresh is already running',
+                req_id,
+            )
+            return
         if self.slideshow_override is not None:
             self.slideshow_override = None
             self.slideshow_override_pending = False
+            self.slideshow_override_force_reupload = False
             self._save_slideshow_override()
             self._publish_slideshow_state()
         await self._do_full_reseed(req_id=req_id)

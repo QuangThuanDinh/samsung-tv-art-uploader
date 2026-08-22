@@ -166,6 +166,8 @@ your-collection-repo/
 
 The easiest way to manage collections is via the **Settings → Collections** tab in the web UI. All 54 available artist collections from [github.com/kohlerryan](https://github.com/kohlerryan?tab=repositories) are listed as checkboxes. **Save List** only saves the repository list. **Pull List** saves and downloads that list, then rebuilds local artwork metadata without contacting the TV. **Update & Refresh** downloads the list and also reseeds the TV.
 
+Slideshow **Apply** preserves matching cached TV uploads and only removes or uploads images that changed, including matte changes. **ReUpload All Images** explicitly removes all user-uploaded images except the standby image and uploads the complete selected set again.
+
 Custom or third-party repository URLs can be pasted into the **Custom Repositories** text area below the checkbox grid, one URL per line.
 
 #### Without the web UI (env file / headless)

@@ -629,6 +629,7 @@
               <button id="sl-override-reset" style="display:none; padding:8px 14px; width:auto; height:auto;">Reset</button>
               <button id="sl-preview-shuffle" style="padding:8px 14px; width:auto; height:auto;" title="Preview a random selection without uploading">Shuffle</button>
               <button id="sl-override-apply" class="ftv-apply" disabled style="opacity:0.6; padding:8px 14px; width:auto; height:auto;">Apply</button>
+              <button id="sl-override-reupload" disabled style="opacity:0.6; padding:8px 14px; width:auto; height:auto;" title="Delete all user-uploaded TV images and upload the selected images again">ReUpload All Images</button>
             </div>
             <div id="sl-presets-section" class="sl-presets-section">
               <div class="sl-presets-header">
@@ -908,6 +909,11 @@
                 if (slideshowClearRefreshPending || slideshowUserRefreshPending) {
                   slideshowClearRefreshPending = false;
                   slideshowUserRefreshPending = false;
+                  if ($slOReupload && $slOReupload._restoreTimer) {
+                    clearTimeout($slOReupload._restoreTimer);
+                    $slOReupload._restoreTimer = null;
+                    $slOReupload.textContent = 'ReUpload All Images';
+                  }
                   slideshowPostClear = false;
                   const refreshPaths = (slideshowMode === 'override' && slideshowOverridePaths.length)
                     ? slideshowOverridePaths : slideshowCurrentPaths;
@@ -1008,7 +1014,7 @@
                   setTimeout(() => { if ($m) $m.textContent = ''; }, 5000);
                 }
               }
-              if (cmd === 'slideshow/override/set') {
+              if (cmd === 'slideshow/override/set' || cmd === 'slideshow/override/reupload') {
                 const $m = document.getElementById('sl-msg');
                 if (status === 'ok' || status === 'error') {
                   // This flag represents only an in-flight UI request. A saved
@@ -1016,6 +1022,13 @@
                   // but the gallery must stay editable while it waits.
                   slideshowUserRefreshPending = false;
                   if (status === 'error') slideshowClearRefreshPending = false;
+                  if (cmd === 'slideshow/override/reupload' && $slOReupload) {
+                    if ($slOReupload._restoreTimer) {
+                      clearTimeout($slOReupload._restoreTimer);
+                      $slOReupload._restoreTimer = null;
+                    }
+                    $slOReupload.textContent = 'ReUpload All Images';
+                  }
                   updateSlideshowActionLocks();
                 }
                 if ($m) {
@@ -1328,11 +1341,15 @@
     function setInfo(attrs) {
       if (refreshInProgress) return;
       // Skip re-render if the display-relevant fields haven't changed
-      const _key = [attrs.file, attrs.artwork_title, attrs.artist_name, attrs.artwork_year, attrs.in_art_mode].join('|');
+      const _key = [attrs.file, attrs.artwork_title, attrs.artist_name, attrs.artwork_year, attrs.art_mode_state, attrs.in_art_mode, attrs.tv_power_on].join('|');
       if (setInfo._lastKey && setInfo._lastKey === _key) return;
       setInfo._lastKey = _key;
       // Update TV connection status in Settings
-      if ('in_art_mode' in attrs) {
+      if (attrs.tv_power_on === false) {
+        _setTvStatus('● TV Power Off', '#d86b6b');
+      } else if (attrs.art_mode_state === 'unknown') {
+        _setTvStatus('● Unknown status', '#a0a0a0');
+      } else if ('in_art_mode' in attrs) {
         _setTvStatus(attrs.in_art_mode ? '● Art mode' : '● Not in art mode', attrs.in_art_mode ? '#6abf69' : '#e5c07b');
       }
       const $np = document.getElementById('viewNowPlaying');
@@ -1349,15 +1366,27 @@
       const description = (typeof descriptionRaw === 'string') ? descriptionRaw.trim() : '';
       const hasDescription = !!(description && !/^\s*(null|none|n\/a)\s*$/i.test(description) && description !== (file || ''));
       const normalizedFile = String(file || '').trim().toLowerCase();
-      const isNotInArtMode = attrs.in_art_mode === false;
-      const isStandbyLike = isNotInArtMode || !normalizedFile || normalizedFile === 'standby.png' || normalizedFile === 'unknown' || normalizedFile === 'unavailable' || normalizedFile === 'none';
+      const isPowerOff = attrs.tv_power_on === false;
+      const isUnknownStatus = !isPowerOff && attrs.art_mode_state === 'unknown';
+      const isNotInArtMode = !isPowerOff && !isUnknownStatus && attrs.in_art_mode === false;
+      const isStandbyLike = isPowerOff || isUnknownStatus || isNotInArtMode || !normalizedFile || normalizedFile === 'standby.png' || normalizedFile === 'unknown' || normalizedFile === 'unavailable' || normalizedFile === 'none' || normalizedFile === 'power_off';
       const isStandby = normalizedFile === 'standby.png';
       slideshowStandby = isStandbyLike;
       updateSlideshowActionLocks();
-      if (_updateSettingsBtnState) _updateSettingsBtnState(isNotInArtMode, isNotInArtMode);
+      if (_updateSettingsBtnState) _updateSettingsBtnState(isPowerOff || isUnknownStatus || isNotInArtMode, isPowerOff || isUnknownStatus || isNotInArtMode);
 
       let t = '';
-      if (isNotInArtMode) {
+      if (isPowerOff) {
+        if ($np) $np.classList.add('standby-mode');
+        $bg.style.background = '#271515';
+        $bg.innerHTML = '';
+        t = 'TV Power Off';
+      } else if (isUnknownStatus) {
+        if ($np) $np.classList.add('standby-mode');
+        $bg.style.background = '#252525';
+        $bg.innerHTML = '';
+        t = 'Unknown status';
+      } else if (isNotInArtMode) {
         if ($np) $np.classList.add('standby-mode');
         $bg.style.background = '#3b2012';
         $bg.innerHTML = '';
@@ -1964,6 +1993,7 @@
     }
 
     const $slOApply    = document.getElementById('sl-override-apply');
+    const $slOReupload = document.getElementById('sl-override-reupload');
     const $slOReset    = document.getElementById('sl-override-reset');
     const $slSavePreset = document.getElementById('sl-save-preset');
     const $slPresetsEl   = document.getElementById('sl-presets');
@@ -2689,6 +2719,12 @@
         const prevMode = slideshowMode;
         slideshowUploading = !!(data.uploading);
         const uploadJustFinished = wasUploading && !slideshowUploading;
+        if (uploadJustFinished && $slOReupload && $slOReupload._restoreTimer) {
+          clearTimeout($slOReupload._restoreTimer);
+          $slOReupload._restoreTimer = null;
+          $slOReupload.textContent = 'ReUpload All Images';
+          slideshowUserRefreshPending = false;
+        }
         // Cancel any in-flight post-upload refresh when a new upload starts
         if (slideshowUploading && _postUploadRefreshTimer) {
           clearTimeout(_postUploadRefreshTimer); _postUploadRefreshTimer = null;
@@ -2862,6 +2898,11 @@
         const canApply = count > 0 && !isSlideshowActionLocked() && differs;
         $slOApply.disabled = !canApply;
         $slOApply.style.opacity = canApply ? 1 : (isSlideshowActionLocked() ? 0.4 : 0.6);
+      }
+      if ($slOReupload) {
+        const canReupload = count > 0 && !isSlideshowActionLocked();
+        $slOReupload.disabled = !canReupload;
+        $slOReupload.style.opacity = canReupload ? 1 : 0.6;
       }
       if ($slOReset) {
         $slOReset.style.display = differs ? '' : 'none';
@@ -3317,6 +3358,32 @@
           $slOApply.disabled = !canApply;
           $slOApply.style.opacity = canApply ? 1 : 0.6;
         }, 8000);
+      };
+    }
+
+    if ($slOReupload) {
+      $slOReupload.onclick = () => {
+        if (!client || !slideshowSelected.size || isSlideshowActionLocked()) return;
+        if (!confirm('Delete all user-uploaded images from the TV and upload this selection again?')) return;
+        const paths = Array.from(slideshowSelected);
+        const payload = { paths, req_id: Date.now(), max_uploads: paths.length };
+        if (dirty && staged.length) payload.collections = staged;
+        slideshowUserRefreshPending = true;
+        slideshowPreviewMode = false;
+        clearSlideshowInProgress();
+        $slOReupload.textContent = 'ReUploading...';
+        updateSlideshowActionLocks();
+        client.publish(
+          `${TOPIC_CMD_PREFIX}/slideshow/override/reupload`,
+          JSON.stringify(payload),
+          { qos: 1 }
+        );
+        $slOReupload._restoreTimer = setTimeout(() => {
+          slideshowUserRefreshPending = false;
+          $slOReupload._restoreTimer = null;
+          $slOReupload.textContent = 'ReUpload All Images';
+          updateSlideshowActionLocks();
+        }, 30 * 60 * 1000);
       };
     }
 
