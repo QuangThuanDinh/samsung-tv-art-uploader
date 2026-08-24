@@ -63,6 +63,10 @@ import csv
 import hashlib
 import unicodedata
 from signal import SIGTERM, SIGINT
+from .BingDailyWallpaperManager import (
+    BING_COLLECTION_ID,
+    BingDailyWallpaperManager,
+)
 from .standy_util import refresh_dynamic_standby
 from .mqtt_integration import MQTTIntegrationMixin, _MatteRejectedError
 from .pil_methods import PIL_methods
@@ -276,6 +280,7 @@ class monitor_and_display(MQTTIntegrationMixin):
         self._tv_shutdown_signaled = False
         self._tv_off_confirmed = False
         self._tv_state_lock = asyncio.Lock()
+        self.bing_daily = BingDailyWallpaperManager(self)
         try:
             #doesn't work in Windows
             asyncio.get_running_loop().add_signal_handler(SIGINT, self.close)
@@ -289,6 +294,8 @@ class monitor_and_display(MQTTIntegrationMixin):
         try:
             if not name:
                 return None
+            if self.bing_daily.is_bing_collection(name):
+                return BING_COLLECTION_ID
             # If already a valid folder, keep as-is
             path = os.path.join(self.media_root, name)
             if os.path.isdir(path):
@@ -387,6 +394,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 raise RuntimeError(f'CSV metadata unavailable at startup: {self.csv_path}')
         else:
             self._load_csv_metadata()
+        self.bing_daily.register_cached_metadata()
         # Load persisted slideshow override before MQTT so state is ready when topics publish
         self._load_slideshow_override()
         self._load_slideshow_presets()
@@ -869,6 +877,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 resolved = self._map_to_artwork_dir(collection) or collection
                 if resolved in available and resolved not in mapped:
                     mapped.append(resolved)
+            mapped = self.bing_daily.normalize_collections(mapped)
             if not mapped:
                 return
             self.selected_collections = mapped
@@ -1117,7 +1126,9 @@ class monitor_and_display(MQTTIntegrationMixin):
                             mapped.append(mc)
                 # If no cached (or none valid), default to all available collections
                 if not mapped:
-                    mapped = sorted(list(have))
+                    mapped = self.bing_daily.normalize_collections(
+                        sorted(collection for collection in have if collection != BING_COLLECTION_ID)
+                    )
                 if mapped:
                     self.selected_collections = mapped
                     desired = self.get_selected_folder()
@@ -2081,6 +2092,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 self._csv_mtime = os.path.getmtime(self.csv_path)
             except Exception:
                 self._csv_mtime = None
+            self.bing_daily.register_cached_metadata()
             self.log.info('Loaded CSV metadata: %d rows, %d headers', len(self._csv_by_file), len(self._csv_headers))
         except Exception as e:
             self.log.warning('Failed to load CSV metadata from %s: %s', self.csv_path, e)
@@ -2257,7 +2269,11 @@ class monitor_and_display(MQTTIntegrationMixin):
                 # Refresh CSV-driven collections periodically without needing a restart
                 self._maybe_reload_csv_and_publish_collections()
                 selection_changed = self.apply_selection()
-                update_due = self.update_time > 0 and (time.time() - self.start >= self.update_time)
+                update_due = (
+                    not self.bing_daily.is_daily_mode()
+                    and self.update_time > 0
+                    and time.time() - self.start >= self.update_time
+                )
                 override_pending = bool(
                     self.slideshow_override_pending and self.slideshow_override
                 )
@@ -2309,6 +2325,8 @@ class monitor_and_display(MQTTIntegrationMixin):
             if self._refresh_in_progress:
                 await asyncio.sleep(0.25)
                 continue
+
+            await self.bing_daily.tick()
 
             # Poll Art Mode only when its state is unknown, after a TV event, or
             # while REST reports that the TV is powered off. Valid on/off Art

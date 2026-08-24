@@ -849,7 +849,9 @@
           if (topic === TOPIC_COLL_ATTR) {
             const data = JSON.parse(payload.toString() || '{}');
             console.log('[collections] received:', JSON.stringify(data));
-            options = (data.options || []).filter(o => o !== '@eaDir');
+            options = normalizeCollectionOptions(
+              (data.options || []).filter(o => o !== '@eaDir')
+            );
             if (!staged.length) staged = baseline.slice();
             renderOptions();
             updateButtons();
@@ -1094,7 +1096,7 @@
           }
           if (topic === TOPIC_SELECTED) {
             const val = (payload.toString() || '').split(',').map(s => s.trim()).filter(Boolean);
-            baseline = val;
+            baseline = normalizeExclusiveCollectionSelection(val);
             if (!dirty) { staged = baseline.slice(); }
             renderOptions();
             updateButtons();
@@ -1129,6 +1131,7 @@
     const $clear = document.getElementById('clear');
 
     // Selection staging state
+    const BING_DAILY_COLLECTION = 'Bing Daily Wallpaper';
     let baseline = [];
     let staged = [];
     let dirty = false;
@@ -1141,6 +1144,28 @@
       if (aa.length !== bb.length) return false;
       for (let i=0;i<aa.length;i++) if (aa[i] !== bb[i]) return false;
       return true;
+    }
+
+    function isBingDailyCollection(value) {
+      return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+        === 'bingdailywallpaper';
+    }
+
+    function normalizeCollectionOptions(values) {
+      const regular = [...new Set(
+        (values || []).filter(value => !isBingDailyCollection(value))
+      )].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+      return [BING_DAILY_COLLECTION, ...regular];
+    }
+
+    function normalizeExclusiveCollectionSelection(values, changedValue) {
+      const unique = [...new Set((values || []).filter(Boolean))];
+      if (changedValue && isBingDailyCollection(changedValue)) {
+        return unique.some(isBingDailyCollection) ? [BING_DAILY_COLLECTION] : [];
+      }
+      const regular = unique.filter(value => !isBingDailyCollection(value));
+      if (changedValue && !isBingDailyCollection(changedValue)) return regular;
+      return unique.some(isBingDailyCollection) ? [BING_DAILY_COLLECTION] : regular;
     }
 
     function updateButtons() {
@@ -1191,18 +1216,24 @@
     function renderOptions() {
       if (!$dropdown) return;
       const setStage = new Set(staged || []);
-      const sorted = options.slice().sort((a, b) =>
-        a.localeCompare(b, undefined, { sensitivity: 'base' })
-      );
-      const allSelected = sorted.length > 0 && sorted.every(o => setStage.has(o));
-      $dropdown.innerHTML = `
+      const sorted = normalizeCollectionOptions(options);
+      const regular = sorted.filter(o => !isBingDailyCollection(o));
+      const allSelected = regular.length > 0 && regular.every(o => setStage.has(o));
+      const bingOption = `
+        <div class="ftv-option ${setStage.has(BING_DAILY_COLLECTION) ? 'selected' : ''}" data-value="${BING_DAILY_COLLECTION}">
+          <div class="ftv-checkbox">
+            <svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>
+          </div>
+          <span>${BING_DAILY_COLLECTION}</span>
+        </div>`;
+      $dropdown.innerHTML = bingOption + `
         <div class="ftv-option ftv-option-all ${allSelected ? 'selected' : ''}" data-value="__select_all__">
           <div class="ftv-checkbox">
             <svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>
           </div>
           <span>Select All</span>
         </div>
-      ` + sorted.map(o => `
+      ` + regular.map(o => `
         <div class="ftv-option ${setStage.has(o) ? 'selected' : ''}" data-value="${o}">
           <div class="ftv-checkbox">
             <svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>
@@ -1215,18 +1246,30 @@
           e.stopPropagation();
           const val = opt.dataset.value;
           if (val === '__select_all__') {
-            const allSel = sorted.every(o => setStage.has(o));
-            if (allSel) { setStage.clear(); } else { sorted.forEach(o => setStage.add(o)); }
+            const allSel = regular.every(o => setStage.has(o));
+            setStage.clear();
+            if (!allSel) regular.forEach(o => setStage.add(o));
+          } else if (isBingDailyCollection(val)) {
+            if (setStage.has(BING_DAILY_COLLECTION)) {
+              setStage.clear();
+            } else {
+              setStage.clear();
+              setStage.add(BING_DAILY_COLLECTION);
+            }
           } else {
+            for (const selected of [...setStage]) {
+              if (isBingDailyCollection(selected)) setStage.delete(selected);
+            }
             if (setStage.has(val)) setStage.delete(val); else setStage.add(val);
           }
-          staged = Array.from(setStage);
+          staged = normalizeExclusiveCollectionSelection(Array.from(setStage), val);
           updateButtons();
           syncTriggerText();
           renderOptions();
           // Immediately request available files for the staged collections so the
-          // slideshow grid shows files from new (not-yet-applied) collections.
-          if (dirty) requestSlideshowAvailable(staged);
+          // slideshow grid follows every picker change, including a return to
+          // the committed baseline where dirty becomes false again.
+          requestSlideshowAvailable(staged);
         });
       });
     }
@@ -1933,7 +1976,7 @@
     const $slApply      = document.getElementById('sl-settings-apply');
     let expectedAvailableCollections = null;
     function normalizeCollectionName(value) {
-      return String(value || '').trim().replace(/_/g, ' ').replace(/\s+/g, ' ').toLowerCase();
+      return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     }
     function sameCollectionSelection(left, right) {
       const a = (left || []).map(normalizeCollectionName).sort();

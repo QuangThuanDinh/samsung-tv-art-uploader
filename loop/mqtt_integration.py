@@ -10,6 +10,8 @@ import threading
 import time
 import uuid
 
+from .BingDailyWallpaperManager import BING_COLLECTION_ID
+
 try:
     import paho.mqtt.client as mqtt  # type: ignore
 except Exception:
@@ -322,6 +324,7 @@ class MQTTIntegrationMixin:
                     # Keep only entries that exist as directories under media_root
                     if mc in have and mc not in mapped:
                         mapped.append(mc)
+                mapped = self.bing_daily.normalize_collections(mapped)
                 if mapped != self.selected_collections:
                     self.selected_collections = mapped
                     self._pending_selection_change = True
@@ -589,9 +592,9 @@ class MQTTIntegrationMixin:
                 return False
 
         try:
-            result = []
+            result = [BING_COLLECTION_ID]
             for d in sorted(os.listdir(self.media_root)):
-                if d in SKIP:
+                if d in SKIP or d == BING_COLLECTION_ID:
                     continue
                 dir_path = os.path.join(self.media_root, d)
                 if not os.path.isdir(dir_path):
@@ -1104,7 +1107,9 @@ class MQTTIntegrationMixin:
             if new_collections is not None:
                 # Commit the collection selection without triggering a separate full reseed.
                 # Also sync self.folder so apply_selection() sees no pending change.
-                self.selected_collections = new_collections
+                self.selected_collections = self.bing_daily.normalize_collections(
+                    new_collections
+                )
                 self._pending_selection_change = False
                 desired = self.get_selected_folder()
                 if os.path.isdir(desired):
@@ -1380,6 +1385,7 @@ class MQTTIntegrationMixin:
                         '(headers: %s); falling back to folder scan', self._csv_headers
                     )
                 opts = self._scan_collections()
+            opts = self.bing_daily.order_collection_options(opts)
             # State: human-friendly count
             try:
                 self._publish_and_wait(self.mqtt_collections_state_topic, str(len(opts)), qos=1, retain=True)
@@ -1427,7 +1433,8 @@ class MQTTIntegrationMixin:
             try:
                 rev = getattr(self, '_dir_to_artist', {})
                 for d in self.selected_collections:
-                    labels.append(rev.get(d, d).replace('_', ' '))
+                    label = self.bing_daily.display_collection(rev.get(d, d))
+                    labels.append(label.replace('_', ' '))
             except Exception:
                 labels = [str(x).replace('_', ' ') for x in self.selected_collections]
             # 1) Keep shared selection topic as CSV for Web UI / command flow compatibility
@@ -1534,7 +1541,7 @@ class MQTTIntegrationMixin:
                                 resolved = self._map_to_artwork_dir(collection)
                                 if resolved and resolved not in mapped:
                                     mapped.append(resolved)
-                            self.selected_collections = mapped
+                            self.selected_collections = self.bing_daily.normalize_collections(mapped)
                             self._pending_selection_change = False
                             desired = self.get_selected_folder()
                             if os.path.isdir(desired):
@@ -1570,7 +1577,7 @@ class MQTTIntegrationMixin:
                     mc = self._map_to_artwork_dir(c)
                     if mc and mc not in mapped:
                         mapped.append(mc)
-                self.selected_collections = mapped
+                self.selected_collections = self.bing_daily.normalize_collections(mapped)
                 self._pending_selection_change = True
                 # Automatic callers retain the existing reseed behavior.
                 self._publish_selected_collections_state(wait_for_publish=False)
@@ -1585,8 +1592,10 @@ class MQTTIntegrationMixin:
                     col = payload.strip()
                 if col:
                     mc = self._map_to_artwork_dir(col) or col
-                    if mc not in self.selected_collections:
-                        self.selected_collections.append(mc)
+                    self.selected_collections = self.bing_daily.add_collection(
+                        self.selected_collections,
+                        mc,
+                    )
                     self._pending_selection_change = True
                     self._publish_selected_collections_state()
                     self._cache_selected_collections()
@@ -1782,7 +1791,12 @@ class MQTTIntegrationMixin:
                 new_cols = None
                 if data and 'collections' in data and isinstance(data['collections'], list):
                     raw_cols = [str(c).strip() for c in data['collections'] if str(c).strip()]
-                    new_cols = [self._map_to_artwork_dir(c) or c for c in raw_cols if (self._map_to_artwork_dir(c) or c)]
+                    new_cols = [
+                        self._map_to_artwork_dir(c) or c
+                        for c in raw_cols
+                        if (self._map_to_artwork_dir(c) or c)
+                    ]
+                    new_cols = self.bing_daily.normalize_collections(new_cols)
                 # Optional 'max_uploads' field: user manually exceeded the limit.
                 new_max = None
                 if data and 'max_uploads' in data:
@@ -1790,6 +1804,28 @@ class MQTTIntegrationMixin:
                         new_max = int(data['max_uploads'])
                     except (ValueError, TypeError):
                         new_max = None
+                daily_collections = (
+                    new_cols
+                    if new_cols is not None
+                    else self.selected_collections
+                )
+                if self.bing_daily.is_daily_collection_selection(daily_collections):
+                    fut = self._schedule_command_coro(
+                        self.bing_daily.apply_selection(
+                            req_id=req_id,
+                            ack_cmd=cmd,
+                            force_reupload=cmd == 'slideshow/override/reupload',
+                        ),
+                        'bing/daily/apply',
+                    )
+                    if not fut:
+                        self._publish_ack(
+                            cmd,
+                            'error',
+                            'Failed to queue Bing Daily Wallpaper update',
+                            req_id,
+                        )
+                    return
                 force_reupload = cmd == 'slideshow/override/reupload'
                 fut = self._schedule_command_coro(
                     self._apply_slideshow_override(
@@ -1952,7 +1988,9 @@ class MQTTIntegrationMixin:
                 preview_cols = None
                 if data and 'collections' in data and isinstance(data['collections'], list):
                     raw_cols = [str(c).strip() for c in data['collections'] if str(c).strip()]
-                    preview_cols = [self._map_to_artwork_dir(c) or c for c in raw_cols]
+                    preview_cols = self.bing_daily.normalize_collections(
+                        [self._map_to_artwork_dir(c) or c for c in raw_cols]
+                    )
                 def publish_available():
                     self._publish_slideshow_available(
                         override_collections=preview_cols,
@@ -1978,7 +2016,9 @@ class MQTTIntegrationMixin:
                 preview_cols = list(self.selected_collections)
                 if data and 'collections' in data and isinstance(data['collections'], list):
                     raw_cols = [str(c).strip() for c in data['collections'] if str(c).strip()]
-                    preview_cols = [self._map_to_artwork_dir(c) or c for c in raw_cols]
+                    preview_cols = self.bing_daily.normalize_collections(
+                        [self._map_to_artwork_dir(c) or c for c in raw_cols]
+                    )
                 max_n = self.max_uploads
                 paths = self._preview_random_selection(preview_cols, max_n)
                 try:

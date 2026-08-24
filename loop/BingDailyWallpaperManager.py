@@ -1,0 +1,543 @@
+"""Built-in Bing Daily Wallpaper collection and synchronization service."""
+
+import asyncio
+import csv
+import datetime
+import json
+import os
+import re
+import tempfile
+import threading
+import time
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+from PIL import Image
+
+
+BING_COLLECTION_ID = 'Bing_DailyWallpaper'
+BING_COLLECTION_LABEL = 'Bing Daily Wallpaper'
+BING_METADATA_URL = (
+    'https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=en-US'
+)
+_BING_ID_PATTERN = re.compile(r'^/?th\?id=(OHR\.[A-Za-z0-9_-]+)$')
+
+
+@dataclass(frozen=True)
+class BingDailyResult:
+    status: str
+    date: Optional[str] = None
+    relative_path: Optional[str] = None
+    metadata: Dict[str, str] = field(default_factory=dict)
+
+
+class BingDailyWallpaperManager:
+    """Own Bing download, cache, selection, and daily TV synchronization."""
+
+    def __init__(self, host):
+        self.host = host
+        self.log = host.log.getChild('BingDailyWallpaper')
+        self.collection_dir = os.path.join(host.media_root, BING_COLLECTION_ID)
+        self.cache_path = os.environ.get(
+            'SAMSUNG_TV_ART_BING_CACHE_FILE',
+            '/data/bing_daily_wallpaper.json',
+        )
+        self.request_timeout = max(
+            1,
+            int(os.environ.get('SAMSUNG_TV_ART_BING_TIMEOUT_SECONDS', '20')),
+        )
+        self._download_lock = threading.Lock()
+        self._last_failed_attempt = 0.0
+        self._failure_count = 0
+        try:
+            os.makedirs(self.collection_dir, exist_ok=True)
+        except OSError as exc:
+            self.log.warning('Unable to create Bing collection directory: %s', exc)
+
+    def normalize_collections(self, collections):
+        """Enforce Bing as an exclusive collection for all command sources."""
+        normalized = []
+        bing_selected = False
+        for value in collections or []:
+            item = str(value or '').strip()
+            if not item:
+                continue
+            if self.is_bing_collection(item):
+                bing_selected = True
+                continue
+            if item not in normalized:
+                normalized.append(item)
+        return [BING_COLLECTION_ID] if bing_selected else normalized
+
+    def display_collection(self, collection):
+        return (
+            BING_COLLECTION_LABEL
+            if collection == BING_COLLECTION_ID
+            else collection
+        )
+
+    def is_daily_collection_selection(self, collections):
+        return self.normalize_collections(collections) == [BING_COLLECTION_ID]
+
+    def add_collection(self, collections, collection):
+        if self.is_bing_collection(collection):
+            return [BING_COLLECTION_ID]
+        regular = [
+            value
+            for value in collections or []
+            if not self.is_bing_collection(value)
+        ]
+        regular.append(collection)
+        return self.normalize_collections(regular)
+
+    @staticmethod
+    def is_bing_collection(value):
+        key = re.sub(r'[^a-z0-9]', '', str(value or '').lower())
+        return key == 'bingdailywallpaper'
+
+    def order_collection_options(self, options):
+        regular = [
+            option
+            for option in options
+            if not self.is_bing_collection(option)
+        ]
+        return [BING_COLLECTION_LABEL] + sorted(
+            set(regular),
+            key=lambda value: value.lower(),
+        )
+
+    def is_daily_mode(self):
+        selected = self.normalize_collections(self.host.selected_collections)
+        override = self.host.slideshow_override or []
+        return (
+            selected == [BING_COLLECTION_ID]
+            and bool(override)
+            and all(self._is_bing_path(path) for path in override)
+        )
+
+    def register_cached_metadata(self):
+        state = self._load_cache()
+        if state:
+            self._register_metadata(state)
+
+    async def tick(self):
+        """Ensure today's image exists and stage active daily mode for TV sync."""
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, self.ensure_today)
+
+            if result.metadata:
+                self._register_metadata(result.metadata)
+
+            if result.status in ('downloaded', 'refreshed'):
+                if result.status == 'downloaded':
+                    self.log.info(
+                        'Downloaded Bing Daily Wallpaper for %s',
+                        result.date,
+                    )
+                if hasattr(self.host, '_collection_file_cache'):
+                    self.host._collection_file_cache.pop(self.collection_dir, None)
+                self.host._publish_collections_state()
+                self.host._publish_slideshow_available()
+                if (
+                    self.is_daily_mode()
+                    and self.host.slideshow_override != [result.relative_path]
+                ):
+                    self._mark_sync_pending(
+                        result.relative_path,
+                        force_reupload=self._requires_full_replace(
+                            result.relative_path
+                        ),
+                    )
+        except Exception as exc:
+            self.log.warning('Bing Daily Wallpaper loop check failed: %s', exc)
+
+    async def apply_selection(
+        self,
+        req_id=None,
+        ack_cmd='slideshow/override/set',
+        force_reupload=False,
+    ):
+        """Activate daily mode using the current cached Bing image."""
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, self.ensure_today, True)
+        if result.metadata:
+            self._register_metadata(result.metadata)
+        if result.status == 'failed' or not result.relative_path:
+            self.host._publish_ack(
+                ack_cmd,
+                'error',
+                'Bing Daily Wallpaper is unavailable',
+                req_id,
+            )
+            return
+        await self.sync_to_tv(
+            req_id=req_id,
+            ack_cmd=ack_cmd,
+            expected_path=result.relative_path,
+            force_reupload=(
+                force_reupload
+                or self._requires_full_replace(result.relative_path)
+            ),
+        )
+
+    async def sync_to_tv(
+        self,
+        req_id=None,
+        ack_cmd='slideshow/override/set',
+        expected_path=None,
+        force_reupload=False,
+    ):
+        """Make the current Bing image the sole daily slideshow upload."""
+        state = self._load_cache()
+        path = expected_path or (state or {}).get('relative_path')
+        if not path or not os.path.isfile(os.path.join(self.host.media_root, path)):
+            self.log.warning('Bing daily sync deferred: cached image is unavailable')
+            if req_id is not None:
+                self.host._publish_ack(
+                    ack_cmd,
+                    'error',
+                    'Bing Daily Wallpaper image is unavailable',
+                    req_id,
+                )
+            return
+        if self.host._refresh_in_progress or self.host._collections_sync_running:
+            if req_id is not None:
+                self.host._publish_ack(
+                    ack_cmd,
+                    'error',
+                    'Another upload or refresh is already running',
+                    req_id,
+                )
+            return
+
+        needs_sync = (
+            force_reupload
+            or self.host.slideshow_override_pending
+            or self.host.slideshow_override != [path]
+            or bool(self.host._slideshow_paths_requiring_upload([path]))
+        )
+        if not needs_sync:
+            self._commit_daily_selection()
+            if req_id is not None:
+                self.host._publish_ack(
+                    ack_cmd,
+                    'ok',
+                    'Bing Daily Wallpaper is already active',
+                    req_id,
+                )
+            return
+
+        await self.host._apply_slideshow_override(
+            [path],
+            req_id=req_id,
+            new_collections=[BING_COLLECTION_ID],
+            max_uploads=None,
+            force_reupload=force_reupload or self._requires_full_replace(path),
+            ack_cmd=ack_cmd,
+        )
+
+    def _commit_daily_selection(self):
+        self.host.selected_collections = [BING_COLLECTION_ID]
+        desired = self.host.get_selected_folder()
+        if os.path.isdir(desired):
+            self.host.folder = desired
+        self.host._pending_selection_change = False
+        self.host._publish_selected_collections_state()
+        self.host._cache_selected_collections()
+
+    def ensure_today(self, force_retry=False):
+        """Fetch and persist today's Bing image unless a valid cache already exists."""
+        with self._download_lock:
+            today = datetime.date.today().strftime('%Y%m%d')
+            cached = self._load_cache()
+            if self._cache_is_current(cached, today):
+                return self._result('unchanged', cached)
+            if not force_retry and not self._failure_retry_due():
+                return self._result('failed', cached)
+
+            try:
+                os.makedirs(self.collection_dir, exist_ok=True)
+                metadata = self._fetch_metadata()
+                source_date = str(metadata.get('startdate') or '')
+                if not source_date:
+                    raise ValueError('Bing metadata contains no startdate')
+                if (
+                    cached
+                    and cached.get('startdate') == source_date
+                    and self._cached_file_exists(cached)
+                ):
+                    self._record_retry_delay()
+                    self.log.info(
+                        'Bing has not published a new daily image yet; '
+                        'keeping %s and retrying later',
+                        cached.get('filename'),
+                    )
+                    return self._result('not_available', cached)
+                image_id = self._extract_image_id(metadata.get('urlbase'))
+                filename = f'{image_id}_UHD.jpg'
+                relative_path = f'{BING_COLLECTION_ID}/{filename}'
+                destination = os.path.join(self.collection_dir, filename)
+
+                image_downloaded = not os.path.isfile(destination)
+                if image_downloaded:
+                    self._download_image(image_id, destination)
+
+                state = {
+                    'version': 1,
+                    'checked_date': today,
+                    'startdate': source_date,
+                    'downloaded_at': datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
+                    'filename': filename,
+                    'relative_path': relative_path,
+                    'urlbase': str(metadata.get('urlbase') or ''),
+                    'title': str(metadata.get('title') or ''),
+                    'copyright': str(metadata.get('copyright') or ''),
+                    'copyrightlink': str(metadata.get('copyrightlink') or ''),
+                }
+                self._write_collection_csv(state)
+                self._remove_old_images(filename)
+                self._write_json_atomic(self.cache_path, state)
+                self._last_failed_attempt = 0.0
+                self._failure_count = 0
+                return self._result(
+                    'downloaded' if image_downloaded else 'refreshed',
+                    state,
+                )
+            except Exception as exc:
+                self._record_retry_delay()
+                self.log.warning('Bing Daily Wallpaper refresh failed: %s', exc)
+                return self._result('failed', cached)
+
+    def _record_retry_delay(self):
+        self._last_failed_attempt = time.monotonic()
+        self._failure_count += 1
+
+    def _failure_retry_due(self):
+        if not self._last_failed_attempt:
+            return True
+        delay = min(3600, 900 * (2 ** min(self._failure_count - 1, 2)))
+        return time.monotonic() - self._last_failed_attempt >= delay
+
+    def _requires_full_replace(self, expected_path):
+        uploaded_paths = {
+            record.get('path_rel', key)
+            for key, record in self.host.uploaded_files.items()
+        }
+        return uploaded_paths != {expected_path}
+
+    def _mark_sync_pending(self, path, force_reupload):
+        if not path:
+            return
+        self.host.selected_collections = [BING_COLLECTION_ID]
+        self.host.slideshow_override = [path]
+        self.host.slideshow_override_pending = True
+        self.host.slideshow_override_force_reupload = force_reupload
+        self.host._save_slideshow_override()
+        self.host._cache_selected_collections()
+        self.host._publish_slideshow_state()
+
+    def _register_metadata(self, state):
+        filename = state.get('filename')
+        relative_path = state.get('relative_path')
+        if not filename or not relative_path:
+            return
+        if not hasattr(self.host, '_csv_by_file'):
+            self.host._csv_by_file = {}
+        if not hasattr(self.host, '_csv_by_path'):
+            self.host._csv_by_path = {}
+        if not hasattr(self.host, '_csv_headers'):
+            self.host._csv_headers = []
+        if not hasattr(self.host, '_dir_to_artist'):
+            self.host._dir_to_artist = {}
+        if not hasattr(self.host, '_artist_to_dir'):
+            self.host._artist_to_dir = {}
+        row = {
+            'artwork_file': filename,
+            'artwork_dir': BING_COLLECTION_ID,
+            'collection_name': BING_COLLECTION_LABEL,
+            'artist_name': 'Bing',
+            'artist_lifespan': '',
+            'artwork_title': state.get('title', ''),
+            'artwork_year': (state.get('startdate') or '')[:4],
+            'artwork_medium': 'Photography',
+            'artwork_description': state.get('copyright', ''),
+            'copyrightlink': state.get('copyrightlink', ''),
+        }
+        self.host._csv_by_file[filename] = row
+        self.host._csv_by_path[relative_path] = row
+        self.host._dir_to_artist[BING_COLLECTION_ID] = BING_COLLECTION_LABEL
+        self.host._artist_to_dir[BING_COLLECTION_LABEL] = BING_COLLECTION_ID
+        for header in row:
+            if header not in self.host._csv_headers:
+                self.host._csv_headers.append(header)
+
+    def _fetch_metadata(self):
+        payload = self._request_bytes(BING_METADATA_URL, max_bytes=1024 * 1024)
+        data = json.loads(payload.decode('utf-8'))
+        images = data.get('images')
+        if not isinstance(images, list) or not images or not isinstance(images[0], dict):
+            raise ValueError('Bing metadata response has no image')
+        return images[0]
+
+    def _download_image(self, image_id, destination):
+        url = f'https://www.bing.com/th?id={image_id}_UHD.jpg'
+        payload = self._request_bytes(url, max_bytes=50 * 1024 * 1024)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix='.bing-',
+            suffix='.jpg',
+            dir=os.path.dirname(destination),
+        )
+        try:
+            with os.fdopen(fd, 'wb') as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            with Image.open(temp_path) as image:
+                image.verify()
+                if image.format != 'JPEG':
+                    raise ValueError(f'Unexpected Bing image format: {image.format}')
+            os.replace(temp_path, destination)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def _request_bytes(self, url, max_bytes):
+        request = urllib.request.Request(
+            url,
+            headers={'User-Agent': 'samsung-tv-art-uploader/1.0'},
+        )
+        with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
+            content_type = response.headers.get_content_type()
+            if url == BING_METADATA_URL and content_type != 'application/json':
+                raise ValueError(f'Unexpected Bing metadata content type: {content_type}')
+            if url != BING_METADATA_URL and not content_type.startswith('image/'):
+                raise ValueError(f'Unexpected Bing image content type: {content_type}')
+            payload = response.read(max_bytes + 1)
+            if len(payload) > max_bytes:
+                raise ValueError('Bing response exceeds the configured safety limit')
+            return payload
+
+    def _write_collection_csv(self, state):
+        path = os.path.join(self.collection_dir, 'artwork_data.csv')
+        fields = [
+            'artwork_file',
+            'artwork_dir',
+            'collection_name',
+            'artist_name',
+            'artist_lifespan',
+            'artwork_title',
+            'artwork_year',
+            'artwork_medium',
+            'artwork_description',
+            'copyrightlink',
+        ]
+        row = {
+            'artwork_file': state['filename'],
+            'artwork_dir': BING_COLLECTION_ID,
+            'collection_name': BING_COLLECTION_LABEL,
+            'artist_name': 'Bing',
+            'artist_lifespan': '',
+            'artwork_title': state.get('title', ''),
+            'artwork_year': (state.get('startdate') or '')[:4],
+            'artwork_medium': 'Photography',
+            'artwork_description': state.get('copyright', ''),
+            'copyrightlink': state.get('copyrightlink', ''),
+        }
+        fd, temp_path = tempfile.mkstemp(
+            prefix='.artwork-data-',
+            suffix='.csv',
+            dir=self.collection_dir,
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8', newline='') as output:
+                writer = csv.DictWriter(output, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow(row)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def _remove_old_images(self, current_filename):
+        for filename in os.listdir(self.collection_dir):
+            path = os.path.join(self.collection_dir, filename)
+            if (
+                filename != current_filename
+                and os.path.isfile(path)
+                and os.path.splitext(filename)[1].lower()
+                in {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+            ):
+                os.remove(path)
+
+    def _cache_is_current(self, state, today):
+        if not state or state.get('checked_date') != today:
+            return False
+        return self._cached_file_exists(state)
+
+    def _cached_file_exists(self, state):
+        relative_path = (state or {}).get('relative_path')
+        return bool(
+            relative_path
+            and self._is_bing_path(relative_path)
+            and os.path.isfile(os.path.join(self.host.media_root, relative_path))
+        )
+
+    def _load_cache(self):
+        try:
+            with open(self.cache_path, 'r', encoding='utf-8') as source:
+                state = json.load(source)
+            return state if isinstance(state, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            self.log.warning('Unable to read Bing daily cache: %s', exc)
+            return {}
+
+    def _write_json_atomic(self, path, value):
+        directory = os.path.dirname(path) or '.'
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix='.bing-cache-',
+            suffix='.json',
+            dir=directory,
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as output:
+                json.dump(value, output, ensure_ascii=False, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    @staticmethod
+    def _extract_image_id(urlbase):
+        match = _BING_ID_PATTERN.fullmatch(str(urlbase or ''))
+        if not match:
+            raise ValueError('Bing metadata contains an invalid urlbase')
+        return match.group(1)
+
+    @staticmethod
+    def _is_bing_path(path):
+        normalized = str(path or '').replace('\\', '/')
+        return normalized.startswith(f'{BING_COLLECTION_ID}/')
+
+    @staticmethod
+    def _result(status, state):
+        state = state or {}
+        return BingDailyResult(
+            status=status,
+            date=state.get('startdate'),
+            relative_path=state.get('relative_path'),
+            metadata=state,
+        )

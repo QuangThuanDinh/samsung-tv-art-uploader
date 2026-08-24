@@ -64,6 +64,12 @@ Open the web UI at `http://localhost:8080` or `http://<host-ip>:8080`.
 
 ## Artwork collections
 
+The Slideshow picker also includes a built-in **Bing Daily Wallpaper**
+collection. It downloads the current Bing homepage image once per day and,
+when applied, keeps that single image on the TV independently of the normal
+slideshow rotation interval. Bing Daily Wallpaper is mutually exclusive with
+Git and local collections.
+
 ### Collection folder structure
 
 Whether you use Git repos or a local bind-mount, collections can be organised in two ways:
