@@ -16,6 +16,7 @@ from loop.BingDailyWallpaperManager import (
     BingDailyResult,
     BingDailyWallpaperManager,
 )
+from loop.MuseumLabelManager import MuseumLabelManager
 
 
 class _Host:
@@ -38,6 +39,7 @@ class _Host:
         self.folder = media_root
         self._collection_file_cache = {}
         self.acks = []
+        self.museum_labels = MuseumLabelManager(self)
 
     def _publish_ack(self, cmd, status, message, req_id):
         self.acks.append((cmd, status, message, req_id))

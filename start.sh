@@ -68,6 +68,12 @@ else
   echo "Skipping startup collection fetch (SAMSUNG_TV_ART_FETCH_ON_START=$FETCH_ON_START)."
 fi
 
+# Generate or refresh labeled derivatives after Git updates. The processor is
+# a no-op unless SAMSUNG_TV_ART_MUSEUM_LABEL is enabled.
+if [ -f "/app/loop/MuseumLabelManager.py" ]; then
+  python -m loop.MuseumLabelManager "$MEDIA_ROOT" || echo "Warning: Museum Label processing failed"
+fi
+
 # Ensure aggregated CSV exists even when startup fetch is disabled.
 CSV_PATH="${SAMSUNG_TV_ART_CSV_PATH:-/app/artwork_data.csv}"
 if [ ! -f "$CSV_PATH" ]; then

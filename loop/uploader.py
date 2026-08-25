@@ -67,6 +67,7 @@ from .BingDailyWallpaperManager import (
     BING_COLLECTION_ID,
     BingDailyWallpaperManager,
 )
+from .MuseumLabelManager import MuseumLabelManager
 from .standy_util import refresh_dynamic_standby
 from .mqtt_integration import MQTTIntegrationMixin, _MatteRejectedError
 from .pil_methods import PIL_methods
@@ -280,6 +281,7 @@ class monitor_and_display(MQTTIntegrationMixin):
         self._tv_shutdown_signaled = False
         self._tv_off_confirmed = False
         self._tv_state_lock = asyncio.Lock()
+        self.museum_labels = MuseumLabelManager(self)
         self.bing_daily = BingDailyWallpaperManager(self)
         try:
             #doesn't work in Windows
@@ -1229,7 +1231,12 @@ class monitor_and_display(MQTTIntegrationMixin):
         '''
         returns list of files in folder is extension matches allowed image types
         '''
-        return [f for f in os.listdir(self.folder) if os.path.isfile(os.path.join(self.folder, f)) and self.get_file_type(os.path.join(self.folder, f)) in self.allowed_ext]
+        files = [
+            f for f in os.listdir(self.folder)
+            if os.path.isfile(os.path.join(self.folder, f))
+            and self.get_file_type(os.path.join(self.folder, f)) in self.allowed_ext
+        ]
+        return self.museum_labels.preferred_filenames(self.folder, files)
         
     async def get_current_artwork(self):
         '''
@@ -1757,11 +1764,17 @@ class monitor_and_display(MQTTIntegrationMixin):
                 continue
 
             try:
-                col_rel = [
-                    os.path.join(collection, f)
-                    for f in os.listdir(collection_path)
+                raw_files = [
+                    f for f in os.listdir(collection_path)
                     if os.path.isfile(os.path.join(collection_path, f))
                     and self.get_file_type(os.path.join(collection_path, f)) in self.allowed_ext
+                ]
+                col_rel = [
+                    os.path.join(collection, f)
+                    for f in self.museum_labels.preferred_filenames(
+                        collection_path,
+                        raw_files,
+                    )
                 ]
             except Exception as e:
                 self.log.warning('Failed to list collection %s: %s', collection, e)

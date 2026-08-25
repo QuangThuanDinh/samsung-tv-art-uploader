@@ -560,7 +560,11 @@ class MQTTIntegrationMixin:
             # Merge CSV columns (ensure every header key exists, even if blank)
             if self._csv_headers:
                 path_key = f"{collection}/{file}" if collection and file else None
-                row = (path_key and getattr(self, '_csv_by_path', {}).get(path_key)) or self._csv_by_file.get(file or "") or {}
+                row = self.museum_labels.metadata_for_path(
+                    path_key or file or '',
+                    getattr(self, '_csv_by_path', {}),
+                    self._csv_by_file,
+                )
                 for h in self._csv_headers:
                     # Keep original header key names to match CSV
                     attrs[h] = str(row.get(h, "") or "")
@@ -583,11 +587,15 @@ class MQTTIntegrationMixin:
 
         def _has_images(path):
             try:
-                return any(
+                images = [
+                    f
+                    for f in os.listdir(path)
+                    if (
                     os.path.isfile(os.path.join(path, f))
                     and os.path.splitext(f)[1].lower() in IMAGE_EXT
-                    for f in os.listdir(path)
-                )
+                    )
+                ]
+                return bool(self.museum_labels.preferred_filenames(path, images))
             except Exception:
                 return False
 
@@ -821,10 +829,10 @@ class MQTTIntegrationMixin:
                 return self._matte_overrides[path_rel]
             if fname and fname in self._matte_overrides:
                 return self._matte_overrides[fname]
-            csv_rec = (
-                (path_rel and getattr(self, '_csv_by_path', {}).get(path_rel))
-                or (fname and self._csv_by_file.get(fname))
-                or {}
+            csv_rec = self.museum_labels.metadata_for_path(
+                path_rel or fname or '',
+                getattr(self, '_csv_by_path', {}),
+                self._csv_by_file,
             )
             csv_matte = (csv_rec.get('matte') or '').strip()
             if csv_matte:
@@ -1021,16 +1029,26 @@ class MQTTIntegrationMixin:
                         if not hasattr(self, '_collection_file_cache'):
                             self._collection_file_cache = {}
                         self._collection_file_cache[coll_path] = raw_files
-                    files = sorted([
+                    image_files = [
                         f for f in raw_files
                         if f.lower().endswith(('.jpg', '.jpeg', '.png'))
                         and f not in ('standby.png',)
-                    ])
+                    ]
+                    files = sorted(
+                        self.museum_labels.preferred_filenames(
+                            coll_path,
+                            image_files,
+                        )
+                    )
                 except Exception:
                     continue
                 for fname in files:
                     path_rel = f"{collection}/{fname}"
-                    csv_rec = getattr(self, '_csv_by_path', {}).get(path_rel) or self._csv_by_file.get(fname, {})
+                    csv_rec = self.museum_labels.metadata_for_path(
+                        path_rel,
+                        getattr(self, '_csv_by_path', {}),
+                        self._csv_by_file,
+                    )
                     artist = (csv_rec.get('artist_name') or '').strip()
                     if not artist:
                         artist = getattr(self, '_dir_to_artist', {}).get(collection, '').strip()
@@ -1463,7 +1481,15 @@ class MQTTIntegrationMixin:
         except Exception as e:
             self.log.warning('Failed to publish selected collections state: %s', e)
 
-    def _publish_ack(self, cmd, status='ok', message='', req_id=None, extra=None):
+    def _publish_ack(
+        self,
+        cmd,
+        status='ok',
+        message='',
+        req_id=None,
+        extra=None,
+        qos=0,
+    ):
         if not self.mqtt_enabled or not self._mqtt:
             return
         try:
@@ -1477,7 +1503,12 @@ class MQTTIntegrationMixin:
                     if k not in ack:
                         ack[k] = v
             ack["selected_collections"] = self.selected_collections
-            self._mqtt.publish(f"{self.mqtt_ack_prefix}/{cmd}", json.dumps(ack, separators=(",", ":")), qos=0, retain=False)
+            self._mqtt.publish(
+                f"{self.mqtt_ack_prefix}/{cmd}",
+                json.dumps(ack, separators=(",", ":")),
+                qos=qos,
+                retain=False,
+            )
         except Exception:
             pass
 
@@ -1780,6 +1811,138 @@ class MQTTIntegrationMixin:
                 self._publish_settings_state()
                 self._publish_ack('slideshow/settings/set', 'ok', 'Slideshow settings updated', req_id)
                 return
+            if cmd == 'slideshow/museum_label/generate':
+                collections = []
+                if data and isinstance(data.get('collections'), list):
+                    raw_collections = [
+                        str(collection).strip()
+                        for collection in data['collections']
+                        if str(collection).strip()
+                    ]
+                    collections = self.bing_daily.normalize_collections([
+                        self._map_to_artwork_dir(collection) or collection
+                        for collection in raw_collections
+                    ])
+                if not collections:
+                    collections = list(self.selected_collections)
+                paths = self.museum_labels.paths_for_collections(collections)
+                if not collections or not paths:
+                    self._publish_ack(
+                        cmd,
+                        'error',
+                        'The selected collections contain no images',
+                        req_id,
+                        qos=1,
+                    )
+                    return
+
+                async def generate_museum_labels():
+                    try:
+                        self._publish_ack(
+                            cmd,
+                            'progress',
+                            (
+                                f'Generating Museum Label images for '
+                                f'{len(paths)} file(s)...'
+                            ),
+                            req_id,
+                            qos=1,
+                        )
+                        def publish_progress(completed, total):
+                            self._publish_ack(
+                                cmd,
+                                'progress',
+                                (
+                                    f'Generating Museum Label images '
+                                    f'({completed}/{total})...'
+                                ),
+                                req_id,
+                                qos=1,
+                            )
+
+                        result = await asyncio.to_thread(
+                            self.museum_labels.regenerate_paths,
+                            paths,
+                            getattr(self, '_csv_by_path', {}),
+                            self._csv_by_file,
+                            publish_progress,
+                        )
+                        for generated in result['generated']:
+                            if generated['path'].startswith(
+                                f'{BING_COLLECTION_ID}/'
+                            ):
+                                self.bing_daily.record_regenerated_derivative(
+                                    generated
+                                )
+                        if hasattr(self, '_collection_file_cache'):
+                            self._collection_file_cache.clear()
+                        self._publish_slideshow_available()
+                        generated_paths = [
+                            item['path'] for item in result['generated']
+                        ]
+                        if result['errors']:
+                            self._publish_ack(
+                                cmd,
+                                'error',
+                                (
+                                    f"Generated {len(generated_paths)} label(s); "
+                                    f"{len(result['errors'])} failed"
+                                ),
+                                req_id,
+                                extra={
+                                    'paths': generated_paths,
+                                    'errors': result['errors'],
+                                },
+                                qos=1,
+                            )
+                        elif not generated_paths:
+                            self._publish_ack(
+                                cmd,
+                                'error',
+                                'No selected images belong to downloaded collections',
+                                req_id,
+                                qos=1,
+                            )
+                        else:
+                            message = (
+                                f'Generated {len(generated_paths)} '
+                                'Museum Label image(s); TV was not changed'
+                            )
+                            self._publish_ack(
+                                cmd,
+                                'ok',
+                                message,
+                                req_id,
+                                extra={
+                                    'paths': generated_paths,
+                                    'generated': result['generated'],
+                                },
+                                qos=1,
+                            )
+                    except Exception as exc:
+                        self.log.warning(
+                            'Museum Label generation failed: %s',
+                            exc,
+                        )
+                        self._publish_ack(
+                            cmd,
+                            'error',
+                            str(exc),
+                            req_id,
+                            qos=1,
+                        )
+
+                if not self._schedule_command_coro(
+                    generate_museum_labels(),
+                    cmd,
+                ):
+                    self._publish_ack(
+                        cmd,
+                        'error',
+                        'Failed to queue Museum Label generation',
+                        req_id,
+                    )
+                return
             if cmd in ('slideshow/override/set', 'slideshow/override/reupload'):
                 paths = []
                 if data and 'paths' in data and isinstance(data['paths'], list):
@@ -2079,6 +2242,29 @@ class MQTTIntegrationMixin:
             self.log.warning('On-demand collections fetch exception: %s', e)
             self._publish_ack(ack_cmd, 'error', 'Git fetch failed — check container logs', req_id)
             return False
+
+        if self.museum_labels.enabled:
+            try:
+                self._publish_ack(
+                    ack_cmd,
+                    'progress',
+                    'Generating Museum Label images...',
+                    req_id,
+                )
+                await asyncio.to_thread(
+                    self.museum_labels.process_git_collections
+                )
+                if hasattr(self, '_collection_file_cache'):
+                    self._collection_file_cache.clear()
+            except Exception as e:
+                self.log.warning('Museum Label processing failed: %s', e)
+                self._publish_ack(
+                    ack_cmd,
+                    'error',
+                    'Museum Label generation failed — check container logs',
+                    req_id,
+                )
+                return False
 
         try:
             self._publish_ack(ack_cmd, 'progress', 'Rebuilding artwork database...', req_id)

@@ -247,11 +247,27 @@ class BingDailyWallpaperManager:
         self.host._publish_selected_collections_state()
         self.host._cache_selected_collections()
 
+    def record_regenerated_derivative(self, generated):
+        """Persist the signature/path for a manually regenerated Bing image."""
+        state = self._load_cache()
+        if not state or not generated:
+            return
+        source_path = generated.get('source_path')
+        if source_path != state.get('source_relative_path'):
+            return
+        state['version'] = 2
+        state['filename'] = os.path.basename(generated['path'])
+        state['relative_path'] = generated['path']
+        state['museum_label_signature'] = generated['signature']
+        self._write_collection_csv(state)
+        self._write_json_atomic(self.cache_path, state)
+
     def ensure_today(self, force_retry=False):
         """Fetch and persist today's Bing image unless a valid cache already exists."""
         with self._download_lock:
             today = datetime.date.today().strftime('%Y%m%d')
             cached = self._load_cache()
+            cached = self._prepare_cached_variant(cached)
             if self._cache_is_current(cached, today):
                 return self._result('unchanged', cached)
             if not force_retry and not self._failure_retry_due():
@@ -276,30 +292,41 @@ class BingDailyWallpaperManager:
                     )
                     return self._result('not_available', cached)
                 image_id = self._extract_image_id(metadata.get('urlbase'))
-                filename = f'{image_id}_UHD.jpg'
-                relative_path = f'{BING_COLLECTION_ID}/{filename}'
-                destination = os.path.join(self.collection_dir, filename)
+                source_filename = f'{image_id}_UHD.jpg'
+                source_relative_path = (
+                    f'{BING_COLLECTION_ID}/{source_filename}'
+                )
+                destination = os.path.join(
+                    self.collection_dir,
+                    source_filename,
+                )
 
                 image_downloaded = not os.path.isfile(destination)
                 if image_downloaded:
                     self._download_image(image_id, destination)
 
                 state = {
-                    'version': 1,
+                    'version': 2,
                     'checked_date': today,
                     'startdate': source_date,
                     'downloaded_at': datetime.datetime.now(
                         datetime.timezone.utc
                     ).isoformat(),
-                    'filename': filename,
-                    'relative_path': relative_path,
+                    'filename': source_filename,
+                    'relative_path': source_relative_path,
+                    'source_filename': source_filename,
+                    'source_relative_path': source_relative_path,
                     'urlbase': str(metadata.get('urlbase') or ''),
                     'title': str(metadata.get('title') or ''),
                     'copyright': str(metadata.get('copyright') or ''),
                     'copyrightlink': str(metadata.get('copyrightlink') or ''),
                 }
+                state = self._prepare_cached_variant(state)
                 self._write_collection_csv(state)
-                self._remove_old_images(filename)
+                self._remove_old_images({
+                    state['filename'],
+                    state['source_filename'],
+                })
                 self._write_json_atomic(self.cache_path, state)
                 self._last_failed_attempt = 0.0
                 self._failure_count = 0
@@ -311,6 +338,66 @@ class BingDailyWallpaperManager:
                 self._record_retry_delay()
                 self.log.warning('Bing Daily Wallpaper refresh failed: %s', exc)
                 return self._result('failed', cached)
+
+    def _prepare_cached_variant(self, state):
+        """Select or generate the active source/derivative for cached metadata."""
+        if not state:
+            return state
+        state = dict(state)
+        original_state = dict(state)
+        active_filename = state.get('filename')
+        source_filename = state.get('source_filename')
+        if not source_filename and active_filename:
+            source_filename = (
+                self.host.museum_labels.source_filename(active_filename)
+                if self.host.museum_labels.is_derivative(active_filename)
+                else active_filename
+            )
+        if not source_filename:
+            return state
+        source_path = os.path.join(self.collection_dir, source_filename)
+        if not os.path.isfile(source_path):
+            return state
+        if (
+            not self.host.museum_labels.enabled
+            and active_filename == source_filename
+            and not state.get('source_filename')
+        ):
+            return state
+
+        source_relative_path = f'{BING_COLLECTION_ID}/{source_filename}'
+        state['version'] = 2
+        state['source_filename'] = source_filename
+        state['source_relative_path'] = source_relative_path
+        if self.host.museum_labels.enabled:
+            destination = os.path.join(
+                self.collection_dir,
+                self.host.museum_labels.derivative_filename(source_filename),
+            )
+            if not os.path.isfile(destination):
+                destination = self.host.museum_labels.process_image(
+                    source_path,
+                    state,
+                    destination,
+                )
+                state['museum_label_signature'] = (
+                    self.host.museum_labels.image_signature(
+                        source_path,
+                        state,
+                    )
+                )
+            filename = os.path.basename(destination)
+            relative_path = f'{BING_COLLECTION_ID}/{filename}'
+        else:
+            state.pop('museum_label_signature', None)
+            filename = source_filename
+            relative_path = source_relative_path
+        state['filename'] = filename
+        state['relative_path'] = relative_path
+        if state != original_state and state.get('checked_date'):
+            self._write_collection_csv(state)
+            self._write_json_atomic(self.cache_path, state)
+        return state
 
     def _record_retry_delay(self):
         self._last_failed_attempt = time.monotonic()
@@ -466,11 +553,11 @@ class BingDailyWallpaperManager:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
-    def _remove_old_images(self, current_filename):
+    def _remove_old_images(self, keep_filenames):
         for filename in os.listdir(self.collection_dir):
             path = os.path.join(self.collection_dir, filename)
             if (
-                filename != current_filename
+                filename not in keep_filenames
                 and os.path.isfile(path)
                 and os.path.splitext(filename)[1].lower()
                 in {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}

@@ -70,6 +70,26 @@ when applied, keeps that single image on the TV independently of the normal
 slideshow rotation interval. Bing Daily Wallpaper is mutually exclusive with
 Git and local collections.
 
+Set `SAMSUNG_TV_ART_MUSEUM_LABEL=true` to generate museum-style labeled
+derivatives for Bing and Git-downloaded artwork. The original image remains
+unchanged; previews and uploads prefer the generated `*.museum-label.jpg` file
+and fall back to the original when it is unavailable. **Generate Museum Label**
+in the Slideshow view force-regenerates labels for the current selection and
+refreshes the local preview only—it does not connect to, upload to, delete
+from, or change the artwork displayed by the TV.
+For Git collections, the label title comes from `artwork_title`, the italic
+description is `artist_name / artwork_year`, and the QR code searches Google
+for the combined title, artist, and year. Bing continues to use its supplied
+copyright link when available.
+Automatic startup and Bing processing generate a Museum Label derivative only
+when it is missing. Existing derivatives are never refreshed automatically;
+use **Generate Museum Label** to deliberately replace every derivative in the
+currently selected collection or collections. This action does not alter the
+checked slideshow images or perform any TV operation.
+The default Liberation Sans regular, bold, and italic fonts are vendored under
+`assets/fonts` and copied into the image, so label rendering does not depend on
+fonts installed by the container host or Linux distribution.
+
 ### Collection folder structure
 
 Whether you use Git repos or a local bind-mount, collections can be organised in two ways:

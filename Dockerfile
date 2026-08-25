@@ -16,10 +16,16 @@ RUN --mount=type=secret,id=pip_index_url,required=false \
         pip install --no-cache-dir git+https://github.com/NickWaterton/samsung-tv-ws-api.git pillow paho-mqtt; \
     fi
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-qrcode \
+    && cp -a /usr/lib/python3/dist-packages/qrcode /usr/local/lib/python3.11/site-packages/ \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY start.sh /app/start.sh
 COPY loop/ /app/loop/
 COPY scripts/ /app/scripts/
+COPY assets/fonts/ /app/assets/fonts/
 RUN chmod +x /app/scripts/*.sh || true
 
 # Web UI and standby artwork baked into the image
