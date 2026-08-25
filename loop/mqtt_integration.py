@@ -1034,12 +1034,14 @@ class MQTTIntegrationMixin:
                         if f.lower().endswith(('.jpg', '.jpeg', '.png'))
                         and f not in ('standby.png',)
                     ]
-                    files = sorted(
-                        self.museum_labels.preferred_filenames(
-                            coll_path,
-                            image_files,
-                        )
+                    files = self.museum_labels.preferred_filenames(
+                        coll_path,
+                        image_files,
                     )
+                    if collection == BING_COLLECTION_ID:
+                        files = self.bing_daily.preview_filenames(files)
+                    else:
+                        files = sorted(files)
                 except Exception:
                     continue
                 for fname in files:
@@ -1867,13 +1869,15 @@ class MQTTIntegrationMixin:
                             self._csv_by_file,
                             publish_progress,
                         )
-                        for generated in result['generated']:
+                        bing_generated = [
+                            generated for generated in result['generated']
                             if generated['path'].startswith(
                                 f'{BING_COLLECTION_ID}/'
-                            ):
-                                self.bing_daily.record_regenerated_derivative(
-                                    generated
-                                )
+                            )
+                        ]
+                        self.bing_daily.record_regenerated_derivatives(
+                            bing_generated
+                        )
                         if hasattr(self, '_collection_file_cache'):
                             self._collection_file_cache.clear()
                         self._publish_slideshow_available()

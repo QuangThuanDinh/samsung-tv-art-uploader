@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import io
 import json
 import logging
@@ -136,6 +137,11 @@ class BingDailyWallpaperManagerTests(unittest.TestCase):
             os.path.isfile(os.path.join(self.media_root, first.relative_path))
         )
         self.assertTrue(os.path.isfile(self.cache_path))
+        with open(self.cache_path, 'r', encoding='utf-8') as source:
+            cached = json.load(source)
+        self.assertEqual(cached['version'], 3)
+        self.assertEqual(len(cached['history']), 1)
+        self.assertEqual(cached['history'][0]['relative_path'], first.relative_path)
         self.assertTrue(
             os.path.isfile(
                 os.path.join(
@@ -197,7 +203,204 @@ class BingDailyWallpaperManagerTests(unittest.TestCase):
         self.assertEqual(result.status, 'not_available')
         self.assertEqual(result.relative_path, relative_path)
         with open(self.cache_path, 'r', encoding='utf-8') as source:
-            self.assertEqual(json.load(source), cached)
+            migrated = json.load(source)
+        self.assertEqual(migrated['version'], 3)
+        self.assertEqual(migrated['checked_date'], cached['checked_date'])
+        self.assertEqual(migrated['history'][0]['relative_path'], relative_path)
+
+    def test_retains_newest_thirty_images_and_prunes_oldest(self):
+        history = []
+        for day in range(1, 31):
+            filename = f'OHR.History{day:02d}_UHD.jpg'
+            Image.new('RGB', (4, 4), color='green').save(
+                os.path.join(self.manager.collection_dir, filename),
+                format='JPEG',
+            )
+            history.append({
+                'startdate': f'202607{day:02d}',
+                'downloaded_at': f'2026-07-{day:02d}T12:00:00+00:00',
+                'filename': filename,
+                'relative_path': f'{BING_COLLECTION_ID}/{filename}',
+                'source_filename': filename,
+                'source_relative_path': f'{BING_COLLECTION_ID}/{filename}',
+            })
+        with open(self.cache_path, 'w', encoding='utf-8') as output:
+            json.dump({
+                'version': 3,
+                'checked_date': '19000101',
+                'current_startdate': '20260730',
+                'history': list(reversed(history)),
+            }, output)
+
+        metadata = {
+            'startdate': '20260825',
+            'urlbase': '/th?id=OHR.Newest',
+            'title': 'Newest',
+            'copyright': 'Newest image',
+            'copyrightlink': 'https://www.bing.com/',
+        }
+
+        def download(_image_id, destination):
+            Image.new('RGB', (4, 4), color='blue').save(
+                destination,
+                format='JPEG',
+            )
+
+        with mock.patch.object(
+            self.manager,
+            '_fetch_metadata',
+            return_value=metadata,
+        ), mock.patch.object(
+            self.manager,
+            '_download_image',
+            side_effect=download,
+        ):
+            result = self.manager.ensure_today()
+
+        self.assertEqual(result.status, 'downloaded')
+        with open(self.cache_path, 'r', encoding='utf-8') as source:
+            cached = json.load(source)
+        self.assertEqual(len(cached['history']), 30)
+        self.assertEqual(cached['history'][0]['startdate'], '20260825')
+        self.assertEqual(cached['history'][-1]['startdate'], '20260702')
+        self.assertFalse(os.path.exists(os.path.join(
+            self.manager.collection_dir,
+            'OHR.History01_UHD.jpg',
+        )))
+        self.assertTrue(os.path.exists(os.path.join(
+            self.manager.collection_dir,
+            'OHR.History02_UHD.jpg',
+        )))
+        with open(
+            os.path.join(self.manager.collection_dir, 'artwork_data.csv'),
+            'r',
+            encoding='utf-8',
+            newline='',
+        ) as source:
+            rows = list(csv.DictReader(source))
+        self.assertEqual(len(rows), 30)
+        self.assertEqual(rows[0]['artwork_title'], 'Newest')
+
+    def test_preview_filenames_follow_newest_first_cache_order(self):
+        names = [
+            'OHR.Newest_UHD.jpg',
+            'OHR.Middle_UHD.jpg',
+            'OHR.Oldest_UHD.jpg',
+        ]
+        with open(self.cache_path, 'w', encoding='utf-8') as output:
+            json.dump({
+                'version': 3,
+                'checked_date': '20260825',
+                'current_startdate': '20260825',
+                'history': [
+                    {
+                        'startdate': f'202608{day:02d}',
+                        'filename': filename,
+                        'relative_path': f'{BING_COLLECTION_ID}/{filename}',
+                    }
+                    for day, filename in zip((25, 24, 23), names)
+                ],
+            }, output)
+
+        ordered = self.manager.preview_filenames(list(reversed(names)))
+
+        self.assertEqual(ordered, names)
+
+    def test_preview_order_uses_source_when_derivative_is_missing(self):
+        newest_source = 'OHR.Newest_UHD.jpg'
+        newest_derivative = self.host.museum_labels.derivative_filename(
+            newest_source
+        )
+        oldest = 'OHR.Oldest_UHD.jpg'
+        with open(self.cache_path, 'w', encoding='utf-8') as output:
+            json.dump({
+                'version': 3,
+                'checked_date': '20260825',
+                'current_startdate': '20260825',
+                'history': [
+                    {
+                        'startdate': '20260825',
+                        'filename': newest_derivative,
+                        'relative_path': (
+                            f'{BING_COLLECTION_ID}/{newest_derivative}'
+                        ),
+                        'source_filename': newest_source,
+                        'source_relative_path': (
+                            f'{BING_COLLECTION_ID}/{newest_source}'
+                        ),
+                    },
+                    {
+                        'startdate': '20260824',
+                        'filename': oldest,
+                        'relative_path': f'{BING_COLLECTION_ID}/{oldest}',
+                    },
+                ],
+            }, output)
+
+        ordered = self.manager.preview_filenames([oldest, newest_source])
+
+        self.assertEqual(ordered, [newest_source, oldest])
+
+    def test_pruning_removes_source_and_museum_label_derivative(self):
+        source = 'OHR.Oldest_UHD.jpg'
+        derivative = self.host.museum_labels.derivative_filename(source)
+        for filename in (source, derivative):
+            Image.new('RGB', (4, 4), color='green').save(
+                os.path.join(self.manager.collection_dir, filename),
+                format='JPEG',
+            )
+
+        self.manager._remove_history_files(
+            [{
+                'startdate': '20260701',
+                'filename': derivative,
+                'relative_path': f'{BING_COLLECTION_ID}/{derivative}',
+            }],
+            [],
+        )
+
+        self.assertFalse(os.path.exists(os.path.join(
+            self.manager.collection_dir,
+            source,
+        )))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.manager.collection_dir,
+            derivative,
+        )))
+
+    def test_registers_metadata_for_every_retained_history_entry(self):
+        history = [
+            {
+                'startdate': '20260825',
+                'filename': 'OHR.New_UHD.jpg',
+                'relative_path': f'{BING_COLLECTION_ID}/OHR.New_UHD.jpg',
+                'title': 'New',
+            },
+            {
+                'startdate': '20260824',
+                'filename': 'OHR.Old_UHD.jpg',
+                'relative_path': f'{BING_COLLECTION_ID}/OHR.Old_UHD.jpg',
+                'title': 'Old',
+            },
+        ]
+        with open(self.cache_path, 'w', encoding='utf-8') as output:
+            json.dump({
+                'version': 3,
+                'checked_date': '20260825',
+                'current_startdate': '20260825',
+                'history': history,
+            }, output)
+
+        self.manager.register_cached_metadata()
+
+        self.assertEqual(
+            self.host._csv_by_file['OHR.New_UHD.jpg']['artwork_title'],
+            'New',
+        )
+        self.assertEqual(
+            self.host._csv_by_file['OHR.Old_UHD.jpg']['artwork_title'],
+            'Old',
+        )
 
     def test_noop_sync_acknowledges_and_commits_daily_selection(self):
         filename = 'OHR.Today_UHD.jpg'

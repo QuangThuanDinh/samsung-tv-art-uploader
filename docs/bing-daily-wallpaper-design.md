@@ -4,13 +4,14 @@
 
 Add a built-in **Bing Daily Wallpaper** collection to the Slideshow tab. Unlike
 Git-backed collections, this collection is managed by the application and
-contains the current Bing homepage image.
+contains up to 30 Bing homepage images, ordered from newest to oldest.
 
 The application checks once per main-loop iteration whether today's image has
 already been downloaded. The persistent cache prevents repeated API and image
 requests during the same day. When Bing Daily Wallpaper is active, the normal
 slideshow rotation interval is ignored and the TV is synchronized to exactly
-one image: the current Bing daily wallpaper.
+one image: the newest Bing daily wallpaper. Local history is available for
+preview but does not change the one-image TV policy.
 
 ## Requirements
 
@@ -57,8 +58,14 @@ one image: the current Bing daily wallpaper.
   <media_root>\Bing_DailyWallpaper\
   ```
 
-- Keep only the current daily image in that directory. Remove the previous
-  image only after the replacement has downloaded and validated successfully.
+- Keep the 30 newest logical daily images in that directory. An original and
+  its generated museum-label derivative represent one logical history entry,
+  not two.
+- After a newly downloaded image and its cache entry have been persisted
+  successfully, prune entries beyond the newest 30 and delete all local files
+  owned by those pruned entries.
+- Never delete the previous valid image before the new image has downloaded,
+  validated, and been recorded successfully.
 - Store enough metadata for the UI and MQTT state, including:
   - Bing `startdate`
   - local filename and relative path
@@ -77,12 +84,14 @@ one image: the current Bing daily wallpaper.
   ```
 
 - On each normal main-loop iteration:
-  1. Read the cached successful Bing date.
+  1. Read the newest successful Bing date from the cache.
   2. If today's image has already been downloaded and the cached file exists,
-     perform no network request.
+     perform no network request and no TV upload, validation, or selection work.
   3. Otherwise, fetch metadata and download the image.
-  4. Atomically replace the image and cache only after the complete operation
-     succeeds.
+  4. Atomically append or update the history entry only after the complete
+     download and validation operation succeeds.
+  5. Sort history by Bing `startdate` descending, retain the newest 30 entries,
+     and remove files belonging only to pruned entries.
 - A missing, malformed, or stale cache must cause a refresh attempt.
 - If the calendar date has changed but Bing still returns the previously cached
   `startdate`, keep the previous image and retry later. Do not mark the new day
@@ -109,8 +118,8 @@ and the user applies an image from that collection.
 While daily mode is active:
 
 - Ignore `SAMSUNG_TV_ART_UPDATE_MINUTES`.
-- Resolve the expected image from the Bing daily cache rather than from a
-  random or sequential slideshow selection.
+- Resolve the expected image from the newest valid Bing history entry rather
+  than from a random or sequential slideshow selection.
 - Verify that the expected image is represented by a valid cached upload on the
   TV.
 - If the current daily image is not on the TV:
@@ -122,6 +131,10 @@ While daily mode is active:
   5. Persist its TV content ID and file signature in the normal upload cache.
 - If the expected image is already on the TV, do not upload it again.
 - Do not repeatedly re-select the image on every loop iteration.
+- Once today's cached entry is known to be the image already uploaded to the TV,
+  short-circuit the daily-mode tick without listing TV images, uploading, or
+  checking/selecting the current TV image again that day. Event-driven recovery
+  and an explicit user action may still invalidate this short-circuit.
 - When a new Bing image is downloaded on a later date and daily mode remains
   active, mark synchronization pending and replace the previous TV image when
   the TV is next available in Art Mode.
@@ -149,8 +162,9 @@ Bing-specific behavior:
 - deriving a safe image URL from a validated Bing image identifier;
 - downloading to a temporary file;
 - validating the downloaded image;
-- atomically replacing the current local image;
-- writing and loading the dedicated cache;
+- atomically adding the current image to local history;
+- pruning local history to the newest 30 logical images;
+- writing, loading, and migrating the dedicated history cache;
 - coordinating the one-image TV synchronization through the uploader's existing
   TV primitives;
 - tracking whether a daily TV synchronization is pending;
@@ -193,8 +207,9 @@ class BingDailyWallpaperManager:
 ```
 
 `tick()` is the facade used by the uploader loop. It performs the cached daily
-check and, when required, stages synchronization through the existing pending
-override workflow. This keeps
+check and, only when a newer image is obtained, stages synchronization through
+the existing pending override workflow. A same-day cache hit returns before any
+TV work. This keeps
 `uploader.py` limited to a single generic delegation point instead of adding
 `is_bing_daily_mode()`, `check_bing_daily()`, or
 `sync_bing_daily_to_tv()` methods there.
@@ -238,19 +253,25 @@ This avoids scattering special-case checkbox behavior across event handlers.
 The backend must enforce the same invariant because MQTT commands can originate
 outside the web UI.
 
-### 5. Metadata integration
+### 5. Metadata and preview integration
 
-The manager should write a one-row `artwork_data.csv` in the Bing collection
-directory using the existing schema:
+The manager should write one row per retained history entry to
+`artwork_data.csv` in the Bing collection directory using the existing schema:
 
 ```csv
 artwork_file,artwork_dir,collection_name,artist_name,artwork_title,artwork_description
 <filename>,Bing_DailyWallpaper,Bing Daily Wallpaper,Bing,<title>,<copyright>
 ```
 
-After a successful download, update or reload the runtime metadata index so the
-new image immediately appears with its title and copyright information. A
-container restart must not be required.
+After a successful download or prune, update or reload the runtime metadata
+index so all retained images immediately appear with their own title and
+copyright information. A container restart must not be required.
+
+The MQTT slideshow-available payload must preserve the Bing cache order instead
+of applying the normal filename sort to this collection. The web UI must render
+the Bing carousel in that payload order: newest image first, followed by older
+images in descending `startdate` order. The current image therefore appears
+first, and history remains deterministic across refreshes and restarts.
 
 ## State Model
 
@@ -258,21 +279,45 @@ Example dedicated cache:
 
 ```json
 {
-  "version": 1,
-  "startdate": "20260824",
-  "downloaded_at": "2026-08-24T18:05:00Z",
-  "filename": "OHR.BKBridge_EN-US2923468858_UHD.jpg",
-  "relative_path": "Bing_DailyWallpaper/OHR.BKBridge_EN-US2923468858_UHD.jpg",
-  "urlbase": "/th?id=OHR.BKBridge_EN-US2923468858",
-  "title": "Crossing into history",
-  "copyright": "Brooklyn Bridge, New York City (© shayes17/Getty Images)",
-  "copyrightlink": "https://www.bing.com/search?q=Brooklyn+Bridge"
+  "version": 3,
+  "checked_date": "20260825",
+  "current_startdate": "20260825",
+  "history": [
+    {
+      "startdate": "20260825",
+      "downloaded_at": "2026-08-25T18:05:00Z",
+      "filename": "OHR.RedwoodPark_EN-US3199427613_UHD.jpg",
+      "relative_path": "Bing_DailyWallpaper/OHR.RedwoodPark_EN-US3199427613_UHD.jpg",
+      "source_filename": "OHR.RedwoodPark_EN-US3199427613_UHD.jpg",
+      "source_relative_path": "Bing_DailyWallpaper/OHR.RedwoodPark_EN-US3199427613_UHD.jpg",
+      "urlbase": "/th?id=OHR.RedwoodPark_EN-US3199427613",
+      "title": "Protecting America's treasures",
+      "copyright": "Sunrise in Redwood National and State Parks, California",
+      "copyrightlink": "https://www.bing.com/search?q=National+Park+Service"
+    },
+    {
+      "startdate": "20260824",
+      "downloaded_at": "2026-08-24T18:05:00Z",
+      "filename": "OHR.BKBridge_EN-US2923468858_UHD.jpg",
+      "relative_path": "Bing_DailyWallpaper/OHR.BKBridge_EN-US2923468858_UHD.jpg",
+      "source_filename": "OHR.BKBridge_EN-US2923468858_UHD.jpg",
+      "source_relative_path": "Bing_DailyWallpaper/OHR.BKBridge_EN-US2923468858_UHD.jpg",
+      "urlbase": "/th?id=OHR.BKBridge_EN-US2923468858",
+      "title": "Crossing into history",
+      "copyright": "Brooklyn Bridge, New York City",
+      "copyrightlink": "https://www.bing.com/search?q=Brooklyn+Bridge"
+    }
+  ]
 }
 ```
 
-The dedicated cache answers which Bing image should exist locally. The existing
-uploaded-files cache remains authoritative for the relationship between that
-local file and its Samsung TV content ID.
+`history` is the ordered source of truth for retained local images and is
+limited to 30 entries. `current_startdate` identifies the entry targeted by
+daily TV mode, while `checked_date` prevents duplicate same-day network and TV
+work. Cache readers must migrate the existing single-entry version 1/2 shape by
+wrapping that valid entry in `history`; migration must not discard its image or
+metadata. The existing uploaded-files cache remains authoritative for the
+relationship between a local file and its Samsung TV content ID.
 
 ## Validation and Safety
 
@@ -281,11 +326,14 @@ local file and its Samsung TV content ID.
   download an arbitrary host supplied by API data.
 - Reject path separators and traversal components in generated filenames.
 - Require a successful HTTP status and an image response.
-- Validate the completed temporary file before replacing the current image.
+- Validate the completed temporary file before adding it to history.
 - Use atomic writes for both image and JSON cache updates.
 - Serialize download attempts so the main loop and manual actions cannot fetch
   concurrently.
-- Preserve the last known-good image and cache on any failure.
+- Preserve all previously known-good history entries and cache data on any
+  download, validation, or cache-write failure.
+- Prune only files referenced by entries removed from history. Do not delete an
+  original or derivative still referenced by a retained entry.
 - Log failures with enough context to diagnose them, but do not treat failure as
   a successful daily check.
 
@@ -296,15 +344,21 @@ local file and its Samsung TV content ID.
    backend state.
 3. The Bing API and image are fetched no more than once after a successful
    download for a given day.
-4. The image is saved under `media\Bing_DailyWallpaper\` and appears in the
-   Slideshow image grid.
-5. Applying the Bing image activates daily mode and leaves exactly that daily
-   image as the active slideshow image on the TV.
-6. Daily mode does not rotate according to
+4. Up to 30 Bing images are retained under `media\Bing_DailyWallpaper\`; when a
+   31st is added, the oldest logical image and its owned derivative are removed.
+5. The dedicated cache records the same retained history in newest-first order,
+   and existing single-entry caches migrate without data loss.
+6. The Slideshow Bing carousel displays all retained history newest first.
+7. Applying a Bing image activates daily mode and leaves exactly the newest
+   daily image as the active slideshow image on the TV, regardless of which
+   history thumbnails are available locally.
+8. Daily mode does not rotate according to
    `SAMSUNG_TV_ART_UPDATE_MINUTES`.
-7. A newly downloaded image replaces the previous TV image automatically when
+9. A newly downloaded image replaces the previous TV image automatically when
    daily mode is active and the TV is available in Art Mode.
-8. Switching to any regular collection restores the existing slideshow
+10. After today's image is already uploaded, subsequent same-day ticks perform
+    no TV listing, upload, current-image check, or selection.
+11. Switching to any regular collection restores the existing slideshow
    behavior without affecting those collections.
-9. API, download, cache, or TV failures preserve the previous usable state and
+12. API, download, cache, pruning, or TV failures preserve the previous usable state and
    remain retryable.

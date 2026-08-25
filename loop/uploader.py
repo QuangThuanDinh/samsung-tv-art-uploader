@@ -1741,6 +1741,16 @@ class monitor_and_display(MQTTIntegrationMixin):
         previously-shown images when the fresh pool is too small to fill all slots.
         Returns list of paths relative to media_root.
         '''
+        if self.bing_daily.is_daily_collection_selection(collections):
+            path = self.bing_daily.current_relative_path()
+            if (
+                max_uploads > 0
+                and path
+                and os.path.isfile(os.path.join(self.media_root, path))
+            ):
+                return [path]
+            return []
+
         last_paths = getattr(self, '_last_slideshow_paths', set())
         # Shuffle so remainder-based extra slots are distributed randomly each run,
         # not always biased toward the alphabetically-first collections.
@@ -2594,6 +2604,15 @@ class monitor_and_display(MQTTIntegrationMixin):
                 'error',
                 'Another upload or refresh is already running',
                 req_id,
+            )
+            return
+        if self.bing_daily.is_daily_collection_selection(
+            self.selected_collections
+        ):
+            await self.bing_daily.apply_selection(
+                req_id=req_id,
+                ack_cmd='collections/refresh',
+                force_reupload=True,
             )
             return
         if self.slideshow_override is not None:
