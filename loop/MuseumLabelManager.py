@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 DERIVATIVE_MARKER = '.museum-label'
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
 MANIFEST_NAME = '.museum-label-manifest.json'
-RENDER_VERSION = 6
+RENDER_VERSION = 8
 
 
 class MuseumLabelManager:
@@ -197,9 +197,9 @@ class MuseumLabelManager:
     def process_git_collections(self):
         """Process source images in Git-managed collection repositories."""
         if not self.enabled or not os.path.isdir(self.media_root):
-            return {'processed': 0, 'unchanged': 0, 'removed': 0}
+            return {'processed': 0, 'unchanged': 0, 'removed': 0, 'errors': 0}
 
-        totals = {'processed': 0, 'unchanged': 0, 'removed': 0}
+        totals = {'processed': 0, 'unchanged': 0, 'removed': 0, 'errors': 0}
         with self._processing_lock:
             for repository in sorted(os.listdir(self.media_root)):
                 repository_path = os.path.join(self.media_root, repository)
@@ -215,10 +215,11 @@ class MuseumLabelManager:
                         totals[key] += stats[key]
         if self.log:
             self.log.info(
-                'Museum Label processed=%d unchanged=%d removed=%d',
+                'Museum Label processed=%d unchanged=%d removed=%d errors=%d',
                 totals['processed'],
                 totals['unchanged'],
                 totals['removed'],
+                totals['errors'],
             )
         return totals
 
@@ -399,14 +400,14 @@ class MuseumLabelManager:
             and not self.is_derivative(name)
         )
         if not sources:
-            return {'processed': 0, 'unchanged': 0, 'removed': 0}
+            return {'processed': 0, 'unchanged': 0, 'removed': 0, 'errors': 0}
 
         metadata = self._load_directory_metadata(directory)
         manifest_path = os.path.join(directory, MANIFEST_NAME)
         manifest = self._load_manifest(manifest_path)
         render_version_matches = manifest.get('version') == RENDER_VERSION
         next_manifest = {'version': RENDER_VERSION, 'images': {}}
-        stats = {'processed': 0, 'unchanged': 0, 'removed': 0}
+        stats = {'processed': 0, 'unchanged': 0, 'removed': 0, 'errors': 0}
 
         for source_name in sources:
             source_path = os.path.join(directory, source_name)
@@ -418,9 +419,24 @@ class MuseumLabelManager:
                 stats['unchanged'] += 1
                 signature = previous.get('signature', '')
             else:
-                self.process_image(source_path, row, destination)
-                stats['processed'] += 1
-                signature = self._signature(source_path, row)
+                try:
+                    self.process_image(source_path, row, destination)
+                    signature = self._signature(source_path, row)
+                    stats['processed'] += 1
+                except Exception as exc:
+                    stats['errors'] += 1
+                    if self.log:
+                        self.log.warning(
+                            'Museum Label skipped %s: %s',
+                            source_path,
+                            exc,
+                        )
+                    if os.path.isfile(destination):
+                        next_manifest['images'][source_name] = {
+                            'signature': previous.get('signature', ''),
+                            'output': destination_name,
+                        }
+                    continue
             next_manifest['images'][source_name] = {
                 'signature': signature,
                 'output': destination_name,
@@ -474,7 +490,7 @@ class MuseumLabelManager:
         qr_left = right - padding - qr_size
         image.paste(qr_image, (qr_left, top + padding))
 
-        text_left = left + padding
+        text_left = left + (padding * 1.5)
         text_right = qr_left - padding
         text_width = max(1, text_right - text_left)
         title_size = max(7, round(box_height * 0.23))

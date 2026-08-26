@@ -149,6 +149,25 @@ class MuseumLabelManagerTests(unittest.TestCase):
         self.assertEqual(second['processed'], 1)
         self.assertEqual(second['unchanged'], 0)
 
+    def test_git_processing_skips_corrupt_image_and_continues(self):
+        repository = os.path.join(self.temp_dir.name, 'Monet')
+        os.makedirs(os.path.join(repository, '.git'))
+        with open(os.path.join(repository, 'broken.jpg'), 'wb') as output:
+            output.write(b'not an image')
+        valid = os.path.join(repository, 'valid.png')
+        Image.new('RGB', (1200, 800), color='blue').save(valid)
+
+        result = self.manager.process_git_collections()
+
+        self.assertEqual(result['processed'], 1)
+        self.assertEqual(result['errors'], 1)
+        self.assertFalse(
+            os.path.exists(os.path.join(repository, 'broken.museum-label.jpg'))
+        )
+        self.assertTrue(
+            os.path.isfile(os.path.join(repository, 'valid.museum-label.jpg'))
+        )
+
     def test_disabled_mode_hides_generated_derivatives(self):
         with mock.patch.dict(
             os.environ,

@@ -24,7 +24,6 @@ class PIL_methods:
     def __init__(self, mon):
         self.log = logging.getLogger('Main.'+__class__.__name__)
         self.mon = mon
-        self.folder = self.mon.folder
         self.uploaded_files = self.mon.uploaded_files
         
     async def initialize(self):
@@ -102,6 +101,7 @@ class PIL_methods:
         only used if PIL is installed
         '''
         files_images = {}
+        folder = self.mon.folder
         for file in files:
             # Hard-skip any non-image artifacts like CSVs
             try:
@@ -111,8 +111,9 @@ class PIL_methods:
             if ext in ['.csv', '.json', '.jsonl', '.txt']:
                 continue
             try:
-                data = Image.open(os.path.join(self.folder, file))
-                format = self.mon.get_file_type(os.path.join(self.folder, file), data)
+                path = os.path.join(folder, file)
+                data = Image.open(path)
+                format = self.mon.get_file_type(path, data)
                 if not (file.lower().endswith(format) or (format=='jpeg' and file.lower().endswith('jpg'))):
                     self.log.warning('file: {} is of type {}, the extension is wrong! please fix this'.format(file, format))
                 files_images[file] = data

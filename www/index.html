@@ -654,7 +654,7 @@
       </div>
       <div class="card-footer">
         <a class="bmc-link" href="https://buymeacoffee.com/kohlerryan" target="_blank" rel="noopener noreferrer">☕ Buy me a coffee</a>
-        <span class="version-tag">v5.0.2</span>
+        <span class="version-tag">v5.0.3</span>
       </div>
     </div>
   </div>
@@ -1046,6 +1046,30 @@
               }
               if (cmd === 'slideshow/museum_label/generate') {
                 const $m = document.getElementById('sl-msg');
+                if (
+                  !$slMuseumGenerate
+                  || String(ack.req_id || '') !== String($slMuseumGenerate.dataset.reqId || '')
+                ) {
+                  return;
+                }
+                if (
+                  status === 'progress'
+                  && $slMuseumGenerate.dataset.acknowledged !== 'true'
+                ) {
+                  $slMuseumGenerate.dataset.acknowledged = 'true';
+                  if ($slMuseumGenerate._restoreTimer) {
+                    clearTimeout($slMuseumGenerate._restoreTimer);
+                  }
+                  $slMuseumGenerate._restoreTimer = setTimeout(() => {
+                    delete $slMuseumGenerate.dataset.running;
+                    delete $slMuseumGenerate.dataset.acknowledged;
+                    delete $slMuseumGenerate.dataset.reqId;
+                    $slMuseumGenerate._restoreTimer = null;
+                    $slMuseumGenerate.textContent = 'Generate Museum Label';
+                    updateSlCounter();
+                    if ($m) $m.textContent = 'Error: Museum Label generation timed out.';
+                  }, 30 * 60 * 1000);
+                }
                 if (status === 'ok' || status === 'error') {
                   if ($slMuseumGenerate) {
                     if ($slMuseumGenerate._restoreTimer) {
@@ -1053,6 +1077,8 @@
                       $slMuseumGenerate._restoreTimer = null;
                     }
                     delete $slMuseumGenerate.dataset.running;
+                    delete $slMuseumGenerate.dataset.acknowledged;
+                    delete $slMuseumGenerate.dataset.reqId;
                     $slMuseumGenerate.textContent = 'Generate Museum Label';
                   }
                   if (status === 'ok' && Array.isArray(ack.paths) && ack.paths.length) {
@@ -3483,13 +3509,16 @@
         if (isSlideshowActionLocked()) return;
         const collections = staged.length ? staged.slice() : baseline.slice();
         if (!collections.length) return;
+        const reqId = Date.now();
         $slMuseumGenerate.dataset.running = 'true';
+        $slMuseumGenerate.dataset.reqId = String(reqId);
+        delete $slMuseumGenerate.dataset.acknowledged;
         $slMuseumGenerate.disabled = true;
         $slMuseumGenerate.style.opacity = 0.7;
         $slMuseumGenerate.textContent = 'Generating...';
         client.publish(
           `${TOPIC_CMD_PREFIX}/slideshow/museum_label/generate`,
-          JSON.stringify({ collections, req_id: Date.now() }),
+          JSON.stringify({ collections, req_id: reqId }),
           { qos: 1 },
           (err) => {
             if (!err) return;
@@ -3498,6 +3527,8 @@
               $slMuseumGenerate._restoreTimer = null;
             }
             delete $slMuseumGenerate.dataset.running;
+            delete $slMuseumGenerate.dataset.acknowledged;
+            delete $slMuseumGenerate.dataset.reqId;
             $slMuseumGenerate.textContent = 'Generate Museum Label';
             const $m = document.getElementById('sl-msg');
             if ($m) $m.textContent = `Error: ${err.message || 'MQTT publish failed'}`;
@@ -3506,12 +3537,14 @@
         );
         $slMuseumGenerate._restoreTimer = setTimeout(() => {
           delete $slMuseumGenerate.dataset.running;
+          delete $slMuseumGenerate.dataset.acknowledged;
+          delete $slMuseumGenerate.dataset.reqId;
           $slMuseumGenerate._restoreTimer = null;
           $slMuseumGenerate.textContent = 'Generate Museum Label';
           updateSlCounter();
           const $m = document.getElementById('sl-msg');
-          if ($m) $m.textContent = 'Error: Museum Label generation timed out.';
-        }, 30 * 60 * 1000);
+          if ($m) $m.textContent = 'Error: Backend did not acknowledge Museum Label generation.';
+        }, 15 * 1000);
       };
     }
 
