@@ -5,7 +5,7 @@ FROM python:3.11-slim
 LABEL org.opencontainers.image.source=https://github.com/kohlerryan/samsung-tv-art-uploader
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git avahi-daemon avahi-utils dbus \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git avahi-daemon avahi-utils dbus tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=secret,id=pip_index_url,required=false \

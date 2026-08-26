@@ -332,6 +332,7 @@ Key variables:
 | `SAMSUNG_TV_ART_GITHUB_TOKEN` | — | GitHub PAT for private repos |
 | `SAMSUNG_TV_ART_FETCH_ON_START` | `false` | Fetch collections on container start |
 | `SAMSUNG_TV_ART_COLLECTIONS_FROM_CSV` | `true` | Use `artwork_data.csv` inside each collection folder to show friendly artist/collection names in the UI dropdown. Set to `false` to show raw folder names instead |
+| `TZ` | `UTC` | Container timezone used for daily Bing wallpaper checks, for example `America/Los_Angeles` |
 | `SAMSUNG_TV_ART_LOG_WEBSOCKET_RESPONSES` | `false` | Log parsed Art WebSocket responses for diagnostics. Sensitive fields are redacted and large payloads are truncated |
 | `SAMSUNG_TV_ART_WEBSOCKET_LOG_MAX_CHARS` | `4000` | Maximum characters logged for each Art WebSocket response |
 | `SAMSUNG_TV_ART_LOCAL_WEB` | `true` | Enable the web UI on port 8080 |

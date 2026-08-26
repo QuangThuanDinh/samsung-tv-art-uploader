@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import datetime
 import io
 import json
 import logging
@@ -103,9 +104,10 @@ class BingDailyWallpaperManagerTests(unittest.TestCase):
         )
 
     def test_downloads_once_and_reuses_current_daily_cache(self):
+        today = datetime.date.today().strftime('%Y%m%d')
         metadata = {
             'images': [{
-                'startdate': '20260824',
+                'startdate': today,
                 'urlbase': '/th?id=OHR.BKBridge_EN-US2923468858',
                 'title': 'Crossing into history',
                 'copyright': 'Brooklyn Bridge',
@@ -151,6 +153,45 @@ class BingDailyWallpaperManagerTests(unittest.TestCase):
                 )
             )
         )
+
+    def test_same_check_date_retries_when_bing_image_is_from_previous_day(self):
+        today_date = datetime.date.today()
+        today = today_date.strftime('%Y%m%d')
+        previous_date = (today_date - datetime.timedelta(days=1)).strftime(
+            '%Y%m%d'
+        )
+        filename = 'OHR.Previous_UHD.jpg'
+        relative_path = f'{BING_COLLECTION_ID}/{filename}'
+        Image.new('RGB', (4, 4), color='green').save(
+            os.path.join(self.manager.collection_dir, filename),
+            format='JPEG',
+        )
+        with open(self.cache_path, 'w', encoding='utf-8') as output:
+            json.dump({
+                'version': 3,
+                'checked_date': today,
+                'current_startdate': previous_date,
+                'history': [{
+                    'startdate': previous_date,
+                    'filename': filename,
+                    'relative_path': relative_path,
+                    'source_filename': filename,
+                    'source_relative_path': relative_path,
+                }],
+            }, output)
+
+        with mock.patch.object(
+            self.manager,
+            '_fetch_metadata',
+            return_value={
+                'startdate': previous_date,
+                'urlbase': '/th?id=OHR.Previous',
+            },
+        ) as fetch:
+            result = self.manager.ensure_today()
+
+        self.assertEqual(result.status, 'not_available')
+        fetch.assert_called_once_with()
 
     def test_invalid_metadata_preserves_previous_image(self):
         previous = os.path.join(

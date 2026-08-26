@@ -748,7 +748,11 @@ class BingDailyWallpaperManager:
     def _cache_is_current(self, state, today):
         if not state or state.get('checked_date') != today:
             return False
-        return self._cached_file_exists(self._current_entry(state))
+        current = self._current_entry(state)
+        return (
+            current.get('startdate') == today
+            and self._cached_file_exists(current)
+        )
 
     def _cached_file_exists(self, state):
         relative_path = (state or {}).get('relative_path')
