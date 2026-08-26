@@ -3,7 +3,9 @@
 import csv
 import hashlib
 import json
+import math
 import os
+import re
 import tempfile
 import threading
 from urllib.parse import quote_plus
@@ -15,7 +17,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 DERIVATIVE_MARKER = '.museum-label'
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
 MANIFEST_NAME = '.museum-label-manifest.json'
-RENDER_VERSION = 8
+RENDER_VERSION = 14
 
 
 class MuseumLabelManager:
@@ -24,7 +26,7 @@ class MuseumLabelManager:
     render_version = RENDER_VERSION
 
     # Ratios measured from examples/Museum_Label.png.
-    LABEL_WIDTH_RATIO = 0.254
+    DESCRIPTION_MAX_LABEL_WIDTH_RATIO = 0.254
     LABEL_HEIGHT_RATIO = 0.084
     RIGHT_MARGIN_RATIO = 0.040
     BOTTOM_MARGIN_RATIO = 0.038
@@ -277,6 +279,11 @@ class MuseumLabelManager:
         skipped = []
         errors = []
         total = len(relative_paths)
+        if self.log:
+            self.log.info(
+                'Museum Label generation started for %d selected image(s)',
+                total,
+            )
         with self._processing_lock:
             for index, relative_path in enumerate(relative_paths, start=1):
                 try:
@@ -284,6 +291,13 @@ class MuseumLabelManager:
                     if not self._is_downloaded_collection(normalized):
                         skipped.append(normalized)
                         continue
+                    if self.log:
+                        self.log.info(
+                            'Museum Label generating %d/%d: %s',
+                            index,
+                            total,
+                            normalized,
+                        )
                     metadata = self.metadata_for_path(
                         str(relative_path).replace('\\', '/'),
                         by_path,
@@ -318,12 +332,28 @@ class MuseumLabelManager:
                         'modified': int(os.path.getmtime(destination)),
                     })
                 except Exception as exc:
+                    if self.log:
+                        self.log.warning(
+                            'Museum Label failed %d/%d: %s: %s',
+                            index,
+                            total,
+                            relative_path,
+                            exc,
+                        )
                     errors.append({
                         'path': str(relative_path),
                         'error': str(exc),
                     })
                 if progress_callback:
                     progress_callback(index, total)
+        if self.log:
+            self.log.info(
+                'Museum Label generation finished: generated=%d skipped=%d '
+                'errors=%d',
+                len(generated),
+                len(skipped),
+                len(errors),
+            )
         return {
             'generated': generated,
             'skipped': skipped,
@@ -398,6 +428,7 @@ class MuseumLabelManager:
             name for name in filenames
             if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS
             and not self.is_derivative(name)
+            and not name.startswith('.')
         )
         if not sources:
             return {'processed': 0, 'unchanged': 0, 'removed': 0, 'errors': 0}
@@ -408,6 +439,21 @@ class MuseumLabelManager:
         render_version_matches = manifest.get('version') == RENDER_VERSION
         next_manifest = {'version': RENDER_VERSION, 'images': {}}
         stats = {'processed': 0, 'unchanged': 0, 'removed': 0, 'errors': 0}
+        processing_total = sum(
+            not os.path.isfile(os.path.join(
+                directory,
+                self.derivative_filename(source_name),
+            ))
+            or not render_version_matches
+            for source_name in sources
+        )
+        processing_index = 0
+        if self.log and processing_total:
+            self.log.info(
+                'Museum Label processing %d image(s) in %s',
+                processing_total,
+                os.path.relpath(directory, self.media_root),
+            )
 
         for source_name in sources:
             source_path = os.path.join(directory, source_name)
@@ -419,7 +465,15 @@ class MuseumLabelManager:
                 stats['unchanged'] += 1
                 signature = previous.get('signature', '')
             else:
+                processing_index += 1
                 try:
+                    if self.log:
+                        self.log.info(
+                            'Museum Label generating %d/%d: %s',
+                            processing_index,
+                            processing_total,
+                            os.path.relpath(source_path, self.media_root),
+                        )
                     self.process_image(source_path, row, destination)
                     signature = self._signature(source_path, row)
                     stats['processed'] += 1
@@ -458,17 +512,55 @@ class MuseumLabelManager:
 
     def _render(self, image, title, description, target):
         width, height = image.size
-        box_width = max(96, round(width * self.LABEL_WIDTH_RATIO))
         box_height = max(34, round(height * self.LABEL_HEIGHT_RATIO))
         right = width - round(width * self.RIGHT_MARGIN_RATIO)
         bottom = height - round(height * self.BOTTOM_MARGIN_RATIO)
-        left = max(0, right - box_width)
         top = max(0, bottom - box_height)
         padding = max(4, round(box_height * 0.14))
         radius = max(2, round(box_height * 0.12))
-        qr_size = max(20, box_height - (padding * 2))
+        original_qr_size = max(20, box_height - (padding * 2))
+        desired_qr_size = max(20, round(original_qr_size * 0.85))
+        qr_padding = max(4, round((box_height - desired_qr_size) / 2))
+        qr_size = max(20, box_height - (qr_padding * 2))
 
         draw = ImageDraw.Draw(image)
+        title_size = max(7, round(box_height * 0.23))
+        body_size = max(6, round(box_height * 0.17))
+        copyright_size = max(5, round(body_size * 0.8))
+        title_font = self._font(self.bold_font_path, title_size)
+        body_font = self._font(self.italic_font_path, body_size)
+        copyright_font = self._font(self.italic_font_path, copyright_size)
+        description_text, copyright_text = self._split_copyright(description)
+        fixed_width = (padding * 2.5) + qr_size + qr_padding
+        description_max_box_width = max(
+            96,
+            round(width * self.DESCRIPTION_MAX_LABEL_WIDTH_RATIO),
+        )
+        description_max_width = max(
+            1,
+            description_max_box_width - fixed_width,
+        )
+        content_width = max(
+            self._text_width(draw, title, title_font),
+            min(
+                self._text_width(draw, description_text, body_font),
+                description_max_width,
+            ),
+            min(
+                self._text_width(draw, copyright_text, copyright_font),
+                description_max_width,
+            ),
+        )
+        max_box_width = max(
+            96,
+            width - (round(width * self.RIGHT_MARGIN_RATIO) * 2),
+        )
+        box_width = self._dynamic_box_width(
+            fixed_width,
+            content_width,
+            max_box_width,
+        )
+        left = max(0, right - box_width)
         draw.rounded_rectangle(
             (left, top, right, bottom),
             radius=radius,
@@ -487,34 +579,74 @@ class MuseumLabelManager:
             fill_color='black',
             back_color='white',
         ).convert('RGB').resize((qr_size, qr_size), Image.Resampling.NEAREST)
-        qr_left = right - padding - qr_size
-        image.paste(qr_image, (qr_left, top + padding))
+        qr_left = right - qr_padding - qr_size
+        image.paste(qr_image, (qr_left, top + qr_padding))
 
         text_left = left + (padding * 1.5)
         text_right = qr_left - padding
         text_width = max(1, text_right - text_left)
-        title_size = max(7, round(box_height * 0.23))
-        body_size = max(6, round(box_height * 0.17))
-        title_font = self._font(self.bold_font_path, title_size)
-        body_font = self._font(self.italic_font_path, body_size)
-        lines = [
+        description_fits = (
+            self._text_width(draw, description_text, body_font) <= text_width
+        )
+        lines = [(
             self._fit_line(draw, title, title_font, text_width),
-            *self._description_lines(
+            title_font,
+            'title',
+            (20, 20, 20),
+        )]
+        if description_fits:
+            lines.append((
+                self._fit_line(draw, description_text, body_font, text_width),
+                body_font,
+                (
+                    'description_before_copyright'
+                    if copyright_text
+                    else 'description'
+                ),
+                (20, 20, 20),
+            ))
+            if copyright_text:
+                lines.append((
+                    self._fit_line(
+                        draw,
+                        copyright_text,
+                        copyright_font,
+                        text_width,
+                    ),
+                    copyright_font,
+                    'copyright',
+                    (110, 110, 110),
+                ))
+        else:
+            description_lines = self._description_lines(
                 draw,
-                description,
+                description_text,
                 body_font,
                 text_width,
                 count=2,
-            ),
-        ]
+            )
+            lines.extend(
+                (
+                    line,
+                    body_font,
+                    'description',
+                    (20, 20, 20),
+                )
+                for line in description_lines
+            )
         line_gap = max(0, round(box_height * 0.01))
         title_bottom_gap = max(2, round(box_height * self.TITLE_BOTTOM_GAP_RATIO))
+        description_bottom_gap = max(2, round(box_height * 0.06))
         y = top + padding
-        for index, line in enumerate(lines):
-            font = title_font if index == 0 else body_font
-            draw.text((text_left, y), line, fill=(20, 20, 20), font=font)
+        for line, font, role, color in lines:
+            draw.text((text_left, y), line, fill=color, font=font)
             y += self._line_height(draw, font)
-            y += title_bottom_gap if index == 0 else line_gap
+            if role == 'title':
+                y += title_bottom_gap
+            elif role == 'description_before_copyright':
+                y += description_bottom_gap
+            else:
+                y += line_gap
 
     def _font(self, path, size):
         try:
@@ -545,9 +677,28 @@ class MuseumLabelManager:
         return lines + [''] * (count - len(lines))
 
     @staticmethod
+    def _split_copyright(text):
+        match = re.search(
+            r'(\(©[^)]*\)|\(\(c\)[^)]*\)|\(c\)\s+.+)$',
+            text.strip(),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return text, ''
+        copyright_text = match.group(1).replace('(', '').replace(')', '').strip()
+        return text[:match.start()].strip(), copyright_text
+
+    @staticmethod
     def _text_width(draw, text, font):
         bounds = draw.textbbox((0, 0), text, font=font)
         return bounds[2] - bounds[0]
+
+    @staticmethod
+    def _dynamic_box_width(fixed_width, content_width, max_box_width):
+        return min(
+            max_box_width,
+            max(96, math.ceil(fixed_width + content_width)),
+        )
 
     def _fit_line(self, draw, text, font, max_width):
         text = text.strip()

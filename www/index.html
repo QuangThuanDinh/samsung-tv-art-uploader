@@ -654,7 +654,7 @@
       </div>
       <div class="card-footer">
         <a class="bmc-link" href="https://buymeacoffee.com/kohlerryan" target="_blank" rel="noopener noreferrer">☕ Buy me a coffee</a>
-        <span class="version-tag">v5.0.4</span>
+        <span class="version-tag">v5.0.5</span>
       </div>
     </div>
   </div>
@@ -940,6 +940,22 @@
               const ack = JSON.parse(payload.toString() || '{}');
               const cmd = (ack && ack.cmd) || '';
               const status = (ack && ack.status) || '';
+              if (
+                cmd === 'slideshow/available/request'
+                && _museumBackendProbe
+                && String(ack.req_id || '') === String(_museumBackendProbe.reqId)
+              ) {
+                const probe = _museumBackendProbe;
+                _museumBackendProbe = null;
+                clearTimeout(probe.timer);
+                if (status === 'ok') {
+                  beginMuseumLabelGeneration(probe.collections);
+                } else {
+                  resetMuseumLabelGenerate(
+                    `Error: ${ack.message || 'Backend readiness check failed'}`
+                  );
+                }
+              }
               if (cmd === 'settings/set') {
                 $envMsg.textContent = status === 'ok' ? 'Settings applied.' : `Settings error: ${ack.message||'unknown'}`;
               }
@@ -2056,9 +2072,9 @@
       slideshowCarouselOffsets = {};
       renderSlideshowGrid();
     }
-    function requestSlideshowAvailable(collections) {
+    function requestSlideshowAvailable(collections, reqId) {
       if (!client) return;
-      const payload = { req_id: Date.now() };
+      const payload = { req_id: reqId || Date.now() };
       const requestedCollections = Array.isArray(collections)
         ? collections
         : (staged.length ? staged : null);
@@ -2071,9 +2087,11 @@
         expectedAvailableCollections = null;
       }
       client.publish(`${TOPIC_CMD_PREFIX}/slideshow/available/request`, JSON.stringify(payload), { qos: 1 });
+      return payload.req_id;
     }
     let _availRetryTimer = null;
     let _postUploadRefreshTimer = null;       // retries available request after upload completes
+    let _museumBackendProbe = null;
     function schedulePostUploadAvailableRefresh(remaining) {
       if (_postUploadRefreshTimer) clearTimeout(_postUploadRefreshTimer);
       if (remaining <= 0) return;
@@ -2451,7 +2469,7 @@
       if (!_slModalEl) return;
       const img = _slModalList[_slModalIdx];
       if (!img) return;
-      const fullUrl = `${location.origin}/app/frame_tv_art_collections/${encodeURIComponent(img.folder)}/${encodeURIComponent(img.file)}`;
+      const fullUrl = `${location.origin}/app/frame_tv_art_collections/${encodeURIComponent(img.folder)}/${encodeURIComponent(img.file)}?v=${encodeURIComponent(img.modified || 0)}`;
       const curMatte = Object.prototype.hasOwnProperty.call(_modalMatteDrafts, img.path)
         ? _modalMatteDrafts[img.path]
         : (slideshowMattes[img.path] || 'none');
@@ -3120,7 +3138,7 @@
           displayedPath = lastAttrs.collection ? `${lastAttrs.collection}/${lastAttrs.file}` : lastAttrs.file;
         }
         const isDisplayed = !!displayedPath && img.path === displayedPath;
-        const thumbUrl = `${location.origin}/app/frame_tv_art_collections/${encodeURIComponent(img.folder)}/${encodeURIComponent(img.file)}`;
+        const thumbUrl = `${location.origin}/app/frame_tv_art_collections/${encodeURIComponent(img.folder)}/${encodeURIComponent(img.file)}?v=${encodeURIComponent(img.modified || 0)}`;
         const draggableAttr = opts.draggable ? ' draggable="true"' : '';
         const draggableCls = opts.draggable ? ' sl-draggable' : '';
         const ordHtml = (opts.ordinal != null) ? `<div class="sl-thumb-ord">${opts.ordinal}</div>` : '';
@@ -3496,55 +3514,68 @@
       };
     }
 
+    function resetMuseumLabelGenerate(message) {
+      if (!$slMuseumGenerate) return;
+      if ($slMuseumGenerate._restoreTimer) {
+        clearTimeout($slMuseumGenerate._restoreTimer);
+        $slMuseumGenerate._restoreTimer = null;
+      }
+      delete $slMuseumGenerate.dataset.running;
+      delete $slMuseumGenerate.dataset.acknowledged;
+      delete $slMuseumGenerate.dataset.reqId;
+      $slMuseumGenerate.textContent = 'Generate Museum Label';
+      updateSlCounter();
+      if (message) {
+        const $m = document.getElementById('sl-msg');
+        if ($m) $m.textContent = message;
+      }
+    }
+
+    function beginMuseumLabelGeneration(collections) {
+      const reqId = Date.now();
+      $slMuseumGenerate.dataset.reqId = String(reqId);
+      delete $slMuseumGenerate.dataset.acknowledged;
+      $slMuseumGenerate.textContent = 'Generating...';
+      client.publish(
+        `${TOPIC_CMD_PREFIX}/slideshow/museum_label/generate`,
+        JSON.stringify({ collections, req_id: reqId }),
+        { qos: 1 },
+        (err) => {
+          if (!err) return;
+          resetMuseumLabelGenerate(`Error: ${err.message || 'MQTT publish failed'}`);
+        }
+      );
+      $slMuseumGenerate._restoreTimer = setTimeout(() => {
+        resetMuseumLabelGenerate(
+          'Error: Backend did not acknowledge Museum Label generation.'
+        );
+      }, 15 * 1000);
+    }
+
     if ($slMuseumGenerate) {
       $slMuseumGenerate.onclick = () => {
         if (!client || !client.connected) {
-          const $m = document.getElementById('sl-msg');
-          if ($m) {
-            $m.textContent = 'Error: MQTT is disconnected. Wait for reconnection and try again.';
-            setTimeout(() => { if ($m) $m.textContent = ''; }, 6000);
-          }
+          resetMuseumLabelGenerate(
+            'Error: MQTT is disconnected. Wait for reconnection and try again.'
+          );
           return;
         }
         if (isSlideshowActionLocked()) return;
         const collections = staged.length ? staged.slice() : baseline.slice();
         if (!collections.length) return;
-        const reqId = Date.now();
         $slMuseumGenerate.dataset.running = 'true';
-        $slMuseumGenerate.dataset.reqId = String(reqId);
-        delete $slMuseumGenerate.dataset.acknowledged;
         $slMuseumGenerate.disabled = true;
         $slMuseumGenerate.style.opacity = 0.7;
-        $slMuseumGenerate.textContent = 'Generating...';
-        client.publish(
-          `${TOPIC_CMD_PREFIX}/slideshow/museum_label/generate`,
-          JSON.stringify({ collections, req_id: reqId }),
-          { qos: 1 },
-          (err) => {
-            if (!err) return;
-            if ($slMuseumGenerate._restoreTimer) {
-              clearTimeout($slMuseumGenerate._restoreTimer);
-              $slMuseumGenerate._restoreTimer = null;
-            }
-            delete $slMuseumGenerate.dataset.running;
-            delete $slMuseumGenerate.dataset.acknowledged;
-            delete $slMuseumGenerate.dataset.reqId;
-            $slMuseumGenerate.textContent = 'Generate Museum Label';
-            const $m = document.getElementById('sl-msg');
-            if ($m) $m.textContent = `Error: ${err.message || 'MQTT publish failed'}`;
-            updateSlCounter();
-          }
-        );
-        $slMuseumGenerate._restoreTimer = setTimeout(() => {
-          delete $slMuseumGenerate.dataset.running;
-          delete $slMuseumGenerate.dataset.acknowledged;
-          delete $slMuseumGenerate.dataset.reqId;
-          $slMuseumGenerate._restoreTimer = null;
-          $slMuseumGenerate.textContent = 'Generate Museum Label';
-          updateSlCounter();
-          const $m = document.getElementById('sl-msg');
-          if ($m) $m.textContent = 'Error: Backend did not acknowledge Museum Label generation.';
+        $slMuseumGenerate.textContent = 'Waiting for backend...';
+        const reqId = Date.now();
+        const timer = setTimeout(() => {
+          _museumBackendProbe = null;
+          resetMuseumLabelGenerate(
+            'Error: Backend is still starting or unavailable.'
+          );
         }, 15 * 1000);
+        _museumBackendProbe = { reqId, collections, timer };
+        requestSlideshowAvailable(collections, reqId);
       };
     }
 

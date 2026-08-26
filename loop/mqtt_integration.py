@@ -1046,6 +1046,11 @@ class MQTTIntegrationMixin:
                     continue
                 for fname in files:
                     path_rel = f"{collection}/{fname}"
+                    full_path = os.path.join(coll_path, fname)
+                    try:
+                        modified = os.stat(full_path).st_mtime_ns
+                    except OSError:
+                        modified = 0
                     csv_rec = self.museum_labels.metadata_for_path(
                         path_rel,
                         getattr(self, '_csv_by_path', {}),
@@ -1062,6 +1067,7 @@ class MQTTIntegrationMixin:
                         'artist': artist,
                         'year': (csv_rec.get('year') or '').strip(),
                         'uploaded': path_rel in uploaded_paths,
+                        'modified': modified,
                     })
 
             # Cap to 5000 images to keep the MQTT payload manageable while covering

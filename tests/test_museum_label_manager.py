@@ -56,10 +56,55 @@ class MuseumLabelManagerTests(unittest.TestCase):
         top = min(y for _x, y in changed)
         right = max(x for x, _y in changed)
         bottom = max(y for _x, y in changed)
-        self.assertAlmostEqual(left / 2000, 0.706, delta=0.005)
+        self.assertGreaterEqual(left / 2000, 0.706)
         self.assertAlmostEqual(top / 1000, 0.878, delta=0.006)
-        self.assertAlmostEqual((right - left + 1) / 2000, 0.254, delta=0.005)
+        self.assertLessEqual((right - left + 1) / 2000, 0.255)
         self.assertAlmostEqual((bottom - top + 1) / 1000, 0.084, delta=0.006)
+
+    def test_copyright_credit_is_split_onto_its_own_line(self):
+        self.assertEqual(
+            self.manager._split_copyright(
+                'Sunrise in Redwood Parks (© HadelProductions/Getty Images)'
+            ),
+            (
+                'Sunrise in Redwood Parks',
+                '© HadelProductions/Getty Images',
+            ),
+        )
+        self.assertEqual(
+            self.manager._split_copyright('Artwork description ((c) Artist Name)'),
+            ('Artwork description', 'c Artist Name'),
+        )
+
+    def test_short_content_uses_narrower_dynamic_box(self):
+        short_image = Image.new('RGB', (2000, 1000), color='black')
+        long_image = Image.new('RGB', (2000, 1000), color='black')
+
+        self.manager._render(short_image, 'A', 'B', 'https://example.com')
+        self.manager._render(
+            long_image,
+            'A considerably longer artwork title',
+            'A considerably longer artwork description',
+            'https://example.com',
+        )
+
+        def changed_width(image):
+            bounds = image.getbbox()
+            return bounds[2] - bounds[0]
+
+        self.assertLess(changed_width(short_image), changed_width(long_image))
+
+    def test_dynamic_box_rounds_up_to_preserve_full_title_width(self):
+        fixed_width = 208.5
+        title_width = 518
+
+        box_width = self.manager._dynamic_box_width(
+            fixed_width,
+            title_width,
+            max_box_width=3600,
+        )
+
+        self.assertGreaterEqual(box_width - fixed_width, title_width)
 
     def test_git_processing_is_idempotent_and_preserves_source(self):
         repository = os.path.join(self.temp_dir.name, 'Monet')
@@ -89,13 +134,18 @@ class MuseumLabelManagerTests(unittest.TestCase):
                 'copyrightlink': '',
             })
 
-        first = self.manager.process_git_collections()
+        with self.assertLogs('test.MuseumLabel', level='INFO') as logs:
+            first = self.manager.process_git_collections()
         second = self.manager.process_git_collections()
 
         derivative = os.path.join(repository, 'painting.museum-label.jpg')
         self.assertTrue(os.path.isfile(source))
         self.assertTrue(os.path.isfile(derivative))
         self.assertEqual(first['processed'], 1)
+        self.assertTrue(any(
+            'Museum Label generating 1/1: Monet/painting.png' in message
+            for message in logs.output
+        ))
         self.assertEqual(second['processed'], 0)
         self.assertEqual(second['unchanged'], 1)
         self.assertEqual(
