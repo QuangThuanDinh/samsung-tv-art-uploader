@@ -46,9 +46,13 @@ else
   GIT_FETCH() { git -c http.sslVersion=tlsv1.2 fetch --depth=1 "$@"; }
 fi
 
-if [ -z "$COL_LIST" ] && [ -f "$LIST_FILE" ]; then
-  # read newline-separated file into space-separated list
+if [ -f "$LIST_FILE" ]; then
+  # The web UI writes this file, so it must override any stale environment
+  # value that was configured when the container was first deployed.
   COL_LIST=$(tr '\n' ' ' < "$LIST_FILE" || true)
+  echo "fetch_collections.sh: Using collection sources from $LIST_FILE"
+elif [ -n "$COL_LIST" ]; then
+  echo "fetch_collections.sh: Using collection sources from SAMSUNG_TV_ART_COLLECTIONS"
 fi
 
 if [ -z "$COL_LIST" ]; then

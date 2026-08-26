@@ -278,6 +278,9 @@ class BingDailyWallpaperManager:
             entry['filename'] = os.path.basename(generated['path'])
             entry['relative_path'] = generated['path']
             entry['museum_label_signature'] = generated['signature']
+            entry['museum_label_render_version'] = (
+                self.host.museum_labels.render_version
+            )
             changed = True
         if not changed:
             return
@@ -440,7 +443,11 @@ class BingDailyWallpaperManager:
                 self.collection_dir,
                 self.host.museum_labels.derivative_filename(source_filename),
             )
-            if not os.path.isfile(destination):
+            if (
+                not os.path.isfile(destination)
+                or state.get('museum_label_render_version')
+                != self.host.museum_labels.render_version
+            ):
                 destination = self.host.museum_labels.process_image(
                     source_path,
                     state,
@@ -452,10 +459,14 @@ class BingDailyWallpaperManager:
                         state,
                     )
                 )
+                state['museum_label_render_version'] = (
+                    self.host.museum_labels.render_version
+                )
             filename = os.path.basename(destination)
             relative_path = f'{BING_COLLECTION_ID}/{filename}'
         else:
             state.pop('museum_label_signature', None)
+            state.pop('museum_label_render_version', None)
             filename = source_filename
             relative_path = source_relative_path
         state['filename'] = filename

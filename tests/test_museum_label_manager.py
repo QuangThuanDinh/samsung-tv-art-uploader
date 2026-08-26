@@ -1,4 +1,5 @@
 import csv
+import json
 import logging
 import os
 import tempfile
@@ -55,10 +56,10 @@ class MuseumLabelManagerTests(unittest.TestCase):
         top = min(y for _x, y in changed)
         right = max(x for x, _y in changed)
         bottom = max(y for _x, y in changed)
-        self.assertAlmostEqual(left / 2000, 0.853, delta=0.005)
-        self.assertAlmostEqual(top / 1000, 0.939, delta=0.006)
-        self.assertAlmostEqual((right - left + 1) / 2000, 0.127, delta=0.005)
-        self.assertAlmostEqual((bottom - top + 1) / 1000, 0.042, delta=0.006)
+        self.assertAlmostEqual(left / 2000, 0.706, delta=0.005)
+        self.assertAlmostEqual(top / 1000, 0.878, delta=0.006)
+        self.assertAlmostEqual((right - left + 1) / 2000, 0.254, delta=0.005)
+        self.assertAlmostEqual((bottom - top + 1) / 1000, 0.084, delta=0.006)
 
     def test_git_processing_is_idempotent_and_preserves_source(self):
         repository = os.path.join(self.temp_dir.name, 'Monet')
@@ -127,6 +128,26 @@ class MuseumLabelManagerTests(unittest.TestCase):
             ['Monet/painting.museum-label.jpg'],
         )
         self.assertEqual(regenerated['errors'], [])
+
+    def test_render_version_change_regenerates_existing_derivative(self):
+        repository = os.path.join(self.temp_dir.name, 'Monet')
+        os.makedirs(os.path.join(repository, '.git'))
+        source = os.path.join(repository, 'painting.png')
+        Image.new('RGB', (1200, 800), color='blue').save(source)
+
+        first = self.manager.process_git_collections()
+        manifest_path = os.path.join(repository, '.museum-label-manifest.json')
+        with open(manifest_path, 'r', encoding='utf-8') as manifest_file:
+            manifest = json.load(manifest_file)
+        manifest['version'] -= 1
+        with open(manifest_path, 'w', encoding='utf-8') as manifest_file:
+            json.dump(manifest, manifest_file)
+
+        second = self.manager.process_git_collections()
+
+        self.assertEqual(first['processed'], 1)
+        self.assertEqual(second['processed'], 1)
+        self.assertEqual(second['unchanged'], 0)
 
     def test_disabled_mode_hides_generated_derivatives(self):
         with mock.patch.dict(

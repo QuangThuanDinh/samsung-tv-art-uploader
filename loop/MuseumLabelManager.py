@@ -15,17 +15,19 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 DERIVATIVE_MARKER = '.museum-label'
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
 MANIFEST_NAME = '.museum-label-manifest.json'
-RENDER_VERSION = 4
+RENDER_VERSION = 6
 
 
 class MuseumLabelManager:
     """Render and select idempotent, metadata-aware museum-label images."""
 
+    render_version = RENDER_VERSION
+
     # Ratios measured from examples/Museum_Label.png.
-    LABEL_WIDTH_RATIO = 0.127
-    LABEL_HEIGHT_RATIO = 0.042
-    RIGHT_MARGIN_RATIO = 0.020
-    BOTTOM_MARGIN_RATIO = 0.019
+    LABEL_WIDTH_RATIO = 0.254
+    LABEL_HEIGHT_RATIO = 0.084
+    RIGHT_MARGIN_RATIO = 0.040
+    BOTTOM_MARGIN_RATIO = 0.038
     TITLE_BOTTOM_GAP_RATIO = 0.10
 
     def __init__(self, host=None, media_root=None, log=None):
@@ -402,6 +404,7 @@ class MuseumLabelManager:
         metadata = self._load_directory_metadata(directory)
         manifest_path = os.path.join(directory, MANIFEST_NAME)
         manifest = self._load_manifest(manifest_path)
+        render_version_matches = manifest.get('version') == RENDER_VERSION
         next_manifest = {'version': RENDER_VERSION, 'images': {}}
         stats = {'processed': 0, 'unchanged': 0, 'removed': 0}
 
@@ -411,7 +414,7 @@ class MuseumLabelManager:
             destination = os.path.join(directory, destination_name)
             row = metadata.get(source_name, {})
             previous = manifest.get('images', {}).get(source_name, {})
-            if os.path.isfile(destination):
+            if os.path.isfile(destination) and render_version_matches:
                 stats['unchanged'] += 1
                 signature = previous.get('signature', '')
             else:
