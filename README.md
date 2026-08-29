@@ -321,6 +321,10 @@ Key variables:
 | Variable | Default | Description |
 |---|---|---|
 | `SAMSUNG_TV_ART_TV_IP` | _(required)_ | IP address of the Frame TV |
+| `SAMSUNG_TV_ART_PORT` | `8001` | Art WebSocket port. Port 8001 uses plain WS without token pairing; set 8002 only when required by the TV firmware |
+| `SAMSUNG_TV_ART_READY_TIMEOUT_SECONDS` | `10` | Seconds to wait for `ms.channel.ready` before replacing the Art connection |
+| `SAMSUNG_TV_ART_HEARTBEAT_SECONDS` | `6` | Seconds between active Art WebSocket heartbeat checks |
+| `SAMSUNG_TV_ART_HEARTBEAT_TIMEOUT_SECONDS` | `2` | Seconds to wait for a heartbeat response before replacing the socket |
 | `SAMSUNG_TV_ART_UPDATE_MINUTES` | `30` | Artwork rotation interval |
 | `SAMSUNG_TV_ART_MAX_UPLOADS` | `30` | Max images kept on TV at once |
 | `SAMSUNG_TV_ART_UPLOAD_DELAY_SECONDS` | `1` | Seconds between individual image uploads. Increase if the TV drops connections |

@@ -1,10 +1,13 @@
 import asyncio
+import contextlib
 import json
 import os
 import socket
 
-from samsungtvws.async_art import SamsungTVAsyncArt
+from samsungtvws import exceptions
+from samsungtvws.async_art import ArtChannelEmitCommand, SamsungTVAsyncArt
 from samsungtvws.async_connection import SamsungTVWSAsyncConnection
+from samsungtvws.event import MS_CHANNEL_CONNECT_EVENT, MS_CHANNEL_READY_EVENT
 
 
 _REDACTED = '[REDACTED]'
@@ -46,32 +49,235 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
         self._log_responses = log_responses
         self._max_response_chars = max_response_chars
         self._retired = False
+        self._channel_id = None
+        self._channel_ready = asyncio.Event()
+        self._start_lock = asyncio.Lock()
+        self._request_lock = asyncio.Lock()
+        self._heartbeat_task = None
+        self._ready_timeout = self._read_positive_seconds(
+            'SAMSUNG_TV_ART_READY_TIMEOUT_SECONDS',
+            10,
+        )
         super().__init__(*args, **kwargs)
+
+    def _read_positive_seconds(self, name, default):
+        try:
+            return max(1.0, float(os.environ.get(name, str(default))))
+        except ValueError:
+            self._response_logger.warning(
+                'Invalid %s value; using %ss',
+                name,
+                default,
+            )
+            return float(default)
+
+    def get_token(self):
+        if self.port == 8001:
+            self._response_logger.info(
+                'Art WebSocket uses ws://%s:8001; token pairing is skipped',
+                self.host,
+            )
+            return None
+        self._response_logger.info(
+            'Art WebSocket uses wss://%s:8002; token authentication is enabled',
+            self.host,
+        )
+        return super().get_token()
 
     async def open(self):
         if self._retired:
             raise ConnectionError('retired TV WebSocket cannot be reopened')
-        # SamsungTVAsyncArt.open() waits indefinitely for ms.channel.ready.
-        # Some Frame firmware accepts the channel but never emits that optional
-        # event, so use the base handshake and let the listener process it if sent.
+        self._channel_id = None
+        self._channel_ready.clear()
         return await SamsungTVWSAsyncConnection.open(self)
 
     async def start_listening(self, *args, **kwargs):
-        if self._retired:
-            raise ConnectionError('retired TV WebSocket cannot be reopened')
+        started = False
+        async with self._start_lock:
+            if self._retired:
+                raise ConnectionError(
+                    'retired TV WebSocket cannot be reopened'
+                )
+            if self._recv_loop is not None and self._recv_loop.done():
+                try:
+                    self._recv_loop.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    self._response_logger.debug(
+                        'Previous TV Art listener failed (%s): %s',
+                        type(exc).__name__,
+                        exc,
+                    )
+                self._recv_loop = None
+            listener_running = (
+                self._recv_loop is not None
+                and not self._recv_loop.done()
+            )
+            if (
+                self.is_alive()
+                and listener_running
+                and self._channel_ready.is_set()
+            ):
+                self._ensure_heartbeat()
+                return False
+            if not self.is_alive():
+                try:
+                    powered_on = await super().on()
+                except Exception as exc:
+                    self._retired = True
+                    await self.close()
+                    raise ConnectionError(
+                        'TV REST power probe failed'
+                    ) from exc
+                if not powered_on:
+                    self._retired = True
+                    await self.close()
+                    raise ConnectionError('TV is powered off')
+                await self.open()
+
+            started = await SamsungTVWSAsyncConnection.start_listening(
+                self,
+                self.process_event,
+            )
+            try:
+                await asyncio.wait_for(
+                    self._channel_ready.wait(),
+                    timeout=self._ready_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                await self.close()
+                raise ConnectionError(
+                    'TV Art WebSocket did not emit ms.channel.ready within '
+                    f'{self._ready_timeout:g}s'
+                ) from exc
+            if not self._channel_id:
+                await self.close()
+                raise ConnectionError(
+                    'TV Art WebSocket did not provide a connection ID'
+                )
+            self._ensure_heartbeat()
+        if started:
+            try:
+                await self.get_artmode()
+            except AssertionError:
+                pass
+        return started
+
+    def _ensure_heartbeat(self):
+        if (
+            self.is_alive()
+            and (
+                self._heartbeat_task is None
+                or self._heartbeat_task.done()
+            )
+        ):
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def close(self):
+        heartbeat_task = self._heartbeat_task
+        self._heartbeat_task = None
+        if (
+            heartbeat_task is not None
+            and heartbeat_task is not asyncio.current_task()
+        ):
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
         try:
-            powered_on = await super().on()
+            await super().close()
+        finally:
+            self._channel_id = None
+            self._channel_ready.clear()
+
+    async def _heartbeat_loop(self):
+        interval = self._read_positive_seconds(
+            'SAMSUNG_TV_ART_HEARTBEAT_SECONDS',
+            6,
+        )
+        timeout = self._read_positive_seconds(
+            'SAMSUNG_TV_ART_HEARTBEAT_TIMEOUT_SECONDS',
+            2,
+        )
+        try:
+            while self.is_alive() and not self._retired:
+                await asyncio.sleep(interval)
+                if not self.is_alive() or self._retired:
+                    return
+                pong_waiter = await self.connection.ping()
+                await asyncio.wait_for(pong_waiter, timeout=timeout)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            self._retired = True
-            await super().close()
-            raise ConnectionError('TV REST power probe failed') from exc
-        if not powered_on:
-            self._retired = True
-            await super().close()
-            raise ConnectionError('TV is powered off')
-        return await super().start_listening(*args, **kwargs)
+            self._response_logger.warning(
+                'TV Art WebSocket heartbeat failed (%s): %s',
+                type(exc).__name__,
+                exc,
+            )
+            await self.close()
+        finally:
+            if self._heartbeat_task is asyncio.current_task():
+                self._heartbeat_task = None
+
+    async def _send_art_request(
+        self,
+        request_data,
+        wait_for_event=None,
+        timeout=2,
+    ):
+        await self.start_listening()
+        async with self._request_lock:
+            listener_running = (
+                self._recv_loop is not None
+                and not self._recv_loop.done()
+            )
+            if (
+                not self.is_alive()
+                or not listener_running
+                or not self._channel_ready.is_set()
+                or not self._channel_id
+            ):
+                raise ConnectionError('TV Art WebSocket channel is not ready')
+
+            request_data = dict(request_data)
+            request_id = request_data.get('request_id') or self.get_uuid()
+            request_data['id'] = self._channel_id
+            request_data['request_id'] = request_id
+
+            response_key = wait_for_event or request_id
+            future = asyncio.get_running_loop().create_future()
+            response_keys = {response_key, request_id}
+            if wait_for_event is None:
+                response_keys.add(self._channel_id)
+            for key in response_keys:
+                self.pending_requests[key] = future
+
+            try:
+                await self.send_command(
+                    ArtChannelEmitCommand.art_app_request(request_data)
+                )
+                response = await asyncio.wait_for(future, timeout)
+                data = json.loads(response['data'])
+            except asyncio.TimeoutError:
+                data = None
+            finally:
+                for key in response_keys:
+                    if self.pending_requests.get(key) is future:
+                        self.pending_requests.pop(key, None)
+
+            if data and data.get('event', '*') == 'error':
+                request = json.loads(data['request_data'])['request']
+                raise exceptions.ResponseError(
+                    f"{request} request failed with error number "
+                    f"{data['error_code']}"
+                )
+            return data
 
     def _websocket_event(self, event, response):
+        if event == MS_CHANNEL_CONNECT_EVENT:
+            self._channel_id = response.get('data', {}).get('id')
+        elif event == MS_CHANNEL_READY_EVENT:
+            self._channel_ready.set()
         if self._log_responses:
             sanitized = _sanitize_websocket_payload(response)
             rendered = json.dumps(
@@ -110,9 +316,9 @@ class FrameTVConnection:
             or socket.gethostname()
             or 'SamsungTvRemote'
         )
-        # Port 8002 is the SSL WebSocket default. Some Tizen 9.0 firmware
-        # filters 8002 and requires the plain WebSocket port 8001.
-        port = int(os.environ.get('SAMSUNG_TV_ART_PORT', '8002'))
+        # Samsung's Art channel is most consistently exposed over plain
+        # WebSocket on 8001. Port 8002 remains available as an explicit override.
+        port = int(os.environ.get('SAMSUNG_TV_ART_PORT', '8001'))
         log_responses = os.environ.get(
             'SAMSUNG_TV_ART_LOG_WEBSOCKET_RESPONSES',
             'false',
@@ -165,6 +371,17 @@ class FrameTVConnection:
     @property
     def retired(self):
         return self._retired or self._client._retired
+
+    @property
+    def port(self):
+        return self._client.port
+
+    @property
+    def requires_pairing(self):
+        if self.port != 8002:
+            return False
+        token = self._client._get_token()
+        return not token or token.strip().lower() in ('none', 'null')
 
     def _register_artmode_callbacks(self):
         async def on_go_to_standby(event, response):

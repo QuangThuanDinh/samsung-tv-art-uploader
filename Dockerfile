@@ -11,9 +11,9 @@ RUN apt-get update \
 RUN --mount=type=secret,id=pip_index_url,required=false \
     if [ -s /run/secrets/pip_index_url ]; then \
         PIP_INDEX_URL="$(cat /run/secrets/pip_index_url)" \
-        pip install --no-cache-dir git+https://github.com/NickWaterton/samsung-tv-ws-api.git pillow paho-mqtt; \
+        pip install --no-cache-dir git+https://github.com/NickWaterton/samsung-tv-ws-api.git@fe95ef1d784cd32f49bf9a07ec479576574eea07 pillow paho-mqtt; \
     else \
-        pip install --no-cache-dir git+https://github.com/NickWaterton/samsung-tv-ws-api.git pillow paho-mqtt; \
+        pip install --no-cache-dir git+https://github.com/NickWaterton/samsung-tv-ws-api.git@fe95ef1d784cd32f49bf9a07ec479576574eea07 pillow paho-mqtt; \
     fi
 
 RUN apt-get update \
