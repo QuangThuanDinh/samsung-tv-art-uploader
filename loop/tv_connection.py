@@ -3,6 +3,7 @@ import contextlib
 import json
 import os
 import socket
+import time
 
 from samsungtvws import exceptions
 from samsungtvws.async_art import ArtChannelEmitCommand, SamsungTVAsyncArt
@@ -502,7 +503,13 @@ class FrameTVConnection:
 
     async def is_powered_on(self):
         """Check TV power through HTTPS REST without opening an Art WebSocket."""
-        return bool(await self._client.on())
+        started = time.monotonic()
+        try:
+            return bool(await self._client.on())
+        finally:
+            elapsed = time.monotonic() - started
+            log_fn = self._logger.info if elapsed >= 1 else self._logger.debug
+            log_fn('TV REST power probe took %.2fs', elapsed)
 
     async def query_artmode(self, power_verified=False):
         """Query Art Mode only after REST confirms that the TV is powered on."""
@@ -513,9 +520,22 @@ class FrameTVConnection:
         last_error = None
         for attempt in range(2):
             try:
+                started = time.monotonic()
                 status = await self._client.get_artmode()
+                elapsed = time.monotonic() - started
                 if status is None:
                     raise TimeoutError('empty Art Mode response')
+                # A slow Art reply is the early warning that the channel is
+                # degrading, so surface it instead of hiding it in debug.
+                log_fn = (
+                    self._logger.info
+                    if elapsed >= 1
+                    else self._logger.debug
+                )
+                log_fn(
+                    'Art request get_artmode_status answered in %.2fs',
+                    elapsed,
+                )
                 return str(status).lower() == 'on'
             except Exception as exc:
                 last_error = exc

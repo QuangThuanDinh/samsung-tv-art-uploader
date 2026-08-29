@@ -1,3 +1,4 @@
+import asyncio
 import time
 import unittest
 from unittest import mock
@@ -161,7 +162,6 @@ class LivenessProbeLoggingTests(unittest.TestCase):
         self.assertEqual(call[1], 'OPEN')
         self.assertTrue(call[2])
         self.assertIn('get_artmode_status', call[0])
-
     def test_retired_connection_is_flagged_in_socket_state(self):
         host = self.make_host()
         host.tv = mock.Mock(retired=True, socket_state='CLOSED')
@@ -184,6 +184,110 @@ class LivenessProbeLoggingTests(unittest.TestCase):
         self.assertEqual(host._describe_socket_state(), 'unavailable')
         host._log_art_liveness_probe()
         host.log.info.assert_called_once()
+
+
+class LivenessProbeLoopTests(unittest.IsolatedAsyncioTestCase):
+    def make_host(self, in_art_mode=True):
+        host = monitor_and_display.__new__(monitor_and_display)
+        host.log = mock.Mock()
+        host.art_status_probe_seconds = 0
+        host._refresh_in_progress = False
+        host._tv_shutdown_signaled = False
+        host._status_check_needed = False
+        host._last_art_status_probe = 0
+        host._in_art_mode = in_art_mode
+        host._artmode_event = asyncio.Event()
+        host.tv = mock.Mock(retired=False, socket_state='OPEN', channel_ready=True)
+        return host
+
+    async def run_one_pass(self, host):
+        """Run exactly one probe iteration, then stop the loop."""
+        calls = []
+
+        async def probe():
+            calls.append(True)
+            if len(calls) > 1:
+                raise asyncio.CancelledError()
+            return host._in_art_mode
+
+        host.safe_in_artmode = probe
+        task = asyncio.create_task(host._art_liveness_loop())
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return calls
+
+    async def test_probe_runs_while_tv_is_not_in_art_mode(self):
+        # A TV sitting on HDMI is exactly when a dead socket must be detected.
+        host = self.make_host(in_art_mode=False)
+
+        calls = await self.run_one_pass(host)
+
+        self.assertTrue(calls)
+        host.log.info.assert_any_call(
+            'Art liveness probe starting: REST power probe + '
+            'get_artmode_status (socket=%s, channel_ready=%s)',
+            'OPEN',
+            True,
+        )
+
+    async def test_probe_skips_while_refresh_in_progress(self):
+        host = self.make_host()
+        host._refresh_in_progress = True
+
+        calls = await self.run_one_pass(host)
+
+        self.assertEqual(calls, [])
+
+    async def test_probe_skips_without_a_connection(self):
+        host = self.make_host()
+        host.tv = None
+
+        calls = await self.run_one_pass(host)
+
+        self.assertEqual(calls, [])
+
+    async def test_art_mode_transition_wakes_main_loop(self):
+        host = self.make_host(in_art_mode=False)
+
+        async def probe():
+            host._in_art_mode = True
+            return True
+
+        host.safe_in_artmode = probe
+        task = asyncio.create_task(host._art_liveness_loop())
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        self.assertTrue(host._artmode_event.is_set())
+        self.assertTrue(host._status_check_needed)
+
+    async def test_probe_survives_a_failing_check(self):
+        host = self.make_host()
+        attempts = []
+
+        async def probe():
+            attempts.append(True)
+            raise ConnectionError('dead channel')
+
+        host.safe_in_artmode = probe
+        task = asyncio.create_task(host._art_liveness_loop())
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        self.assertTrue(attempts)
+        host.log.debug.assert_called()
 
 
 if __name__ == '__main__':

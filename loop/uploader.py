@@ -586,6 +586,44 @@ class monitor_and_display(MQTTIntegrationMixin):
         finally:
             os._exit(1)
 
+    async def _art_liveness_loop(self):
+        """Prove the Art channel still answers, independent of the main loop.
+
+        This runs regardless of the cached art mode: a TV sitting on HDMI is
+        exactly when a silently dead socket would otherwise go unnoticed,
+        because no art_mode_changed event can arrive to wake anything up.
+        """
+        while True:
+            await asyncio.sleep(self.art_status_probe_seconds)
+            try:
+                if self._refresh_in_progress or self.tv is None:
+                    continue
+                if self._tv_shutdown_signaled:
+                    continue
+                self._log_art_liveness_probe()
+                previous = self._in_art_mode
+                started = time.monotonic()
+                in_artmode = await self.safe_in_artmode()
+                self._last_art_status_probe = time.time()
+                # Elapsed covers the REST power probe plus the Art request, so
+                # the per-step timings logged by the connection are the ones to
+                # compare when diagnosing slowness.
+                self.log.info(
+                    'Art liveness probe answered: art_mode=%s (socket=%s, '
+                    'total=%.2fs incl. REST probe)',
+                    in_artmode,
+                    self._describe_socket_state(),
+                    time.monotonic() - started,
+                )
+                if bool(in_artmode) != bool(previous):
+                    # Wake the main loop so a transition is acted on promptly.
+                    self._status_check_needed = True
+                    self._artmode_event.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.log.debug('Art liveness probe failed: %s', exc)
+
     def _describe_socket_state(self):
         """Report the Art WebSocket transport state for diagnostic logging."""
         tv = self.tv
@@ -606,8 +644,8 @@ class monitor_and_display(MQTTIntegrationMixin):
         except Exception:
             channel_ready = False
         self.log.info(
-            'Art liveness probe: sending get_artmode_status (socket=%s, '
-            'channel_ready=%s)',
+            'Art liveness probe starting: REST power probe + '
+            'get_artmode_status (socket=%s, channel_ready=%s)',
             self._describe_socket_state(),
             channel_ready,
         )
@@ -2326,6 +2364,20 @@ class monitor_and_display(MQTTIntegrationMixin):
         '''
         await self.initialize()
         self._status_check_needed = True
+        probe_task = None
+        if self.art_status_probe_seconds > 0:
+            probe_task = asyncio.create_task(self._art_liveness_loop())
+        try:
+            await self._select_artwork_loop()
+        finally:
+            if probe_task is not None:
+                probe_task.cancel()
+                try:
+                    await probe_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _select_artwork_loop(self):
         while True:
             if self._refresh_in_progress:
                 await asyncio.sleep(0.25)
@@ -2333,31 +2385,14 @@ class monitor_and_display(MQTTIntegrationMixin):
 
             await self.bing_daily.tick()
 
-            # Poll Art Mode only when its state is unknown, after a TV event, or
-            # while REST reports that the TV is powered off. A periodic
-            # application-level probe also catches sockets whose ping/pong
-            # transport is alive but whose Art service no longer responds.
-            status_probe_due = (
-                self._in_art_mode is True
-                and time.time() - self._last_art_status_probe
-                >= self.art_status_probe_seconds
-            )
+            # The liveness probe now runs on its own task so its interval is
+            # independent of this loop's period and of the current art mode.
             if (
                 self._status_check_needed
                 or self._tv_powered_on is False
-                or status_probe_due
             ):
                 self._artmode_event.clear()
-                if status_probe_due:
-                    self._log_art_liveness_probe()
                 in_artmode = await self.safe_in_artmode()
-                if status_probe_due:
-                    self.log.info(
-                        'Art liveness probe answered: art_mode=%s (socket=%s)',
-                        in_artmode,
-                        self._describe_socket_state(),
-                    )
-                self._last_art_status_probe = time.time()
             else:
                 in_artmode = self._in_art_mode is True
 

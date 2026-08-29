@@ -324,7 +324,7 @@ Key variables:
 | `SAMSUNG_TV_ART_READY_TIMEOUT_SECONDS` | `10` | Seconds to wait for `ms.channel.ready` before replacing the Art connection |
 | `SAMSUNG_TV_ART_HEARTBEAT_SECONDS` | `6` | Seconds between active Art WebSocket heartbeat checks |
 | `SAMSUNG_TV_ART_HEARTBEAT_TIMEOUT_SECONDS` | `2` | Seconds to wait for a heartbeat response before replacing the socket |
-| `SAMSUNG_TV_ART_STATUS_PROBE_SECONDS` | `15` | Max seconds between real Art requests used to prove the connection still answers. Each probe logs the socket state at INFO. Catches sockets that stay open but whose Art service stopped responding |
+| `SAMSUNG_TV_ART_STATUS_PROBE_SECONDS` | `15` | Interval for the Art liveness probe, which runs on its own task independent of `SAMSUNG_TV_ART_CHECK_SECONDS`. Issues a real Art request and logs the socket state, so a socket that stays open while the Art service is dead is detected even when the TV is on HDMI. Set `0` to disable |
 | `SAMSUNG_TV_ART_CONNECT_RETRY_MAX_SECONDS` | `60` | Upper bound on the escalating retry delay after failed Art handshakes (5s, 10s, 20s, … capped here) |
 | `SAMSUNG_TV_ART_CONNECT_WATCHDOG_SECONDS` | `1800` | Exit non-zero when the TV answers REST but no Art handshake has succeeded for this long, so the container restart policy supplies a clean process. Set `0` to disable. Requires a restart policy such as `restart: unless-stopped` |
 | `SAMSUNG_TV_ART_UPDATE_MINUTES` | `30` | Artwork rotation interval |
