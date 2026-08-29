@@ -1199,7 +1199,7 @@ class MQTTIntegrationMixin:
                 # recover incrementally without deleting successful retries.
                 self.slideshow_override_force_reupload = False
                 self._save_slideshow_override()
-                to_upload = list(paths)
+                to_upload = self.reuse_dynamic_standby_upload(paths)
             else:
                 desired_paths = set(paths)
                 cached_by_path = {

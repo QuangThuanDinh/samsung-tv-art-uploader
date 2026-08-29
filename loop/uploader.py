@@ -942,6 +942,55 @@ class monitor_and_display(MQTTIntegrationMixin):
         except Exception as e:
             self.log.warning('Failed to cache standby content_id: %s', e)
 
+    def reuse_dynamic_standby_upload(self, paths):
+        """Reuse the protected dynamic standby when its source is in the slideshow."""
+        paths = list(paths)
+        if not self.dynamic_standby or not self.standby_content_id:
+            return paths
+        try:
+            with open(
+                self.dynamic_standby_state_path,
+                'r',
+                encoding='utf-8',
+            ) as state_file:
+                source = json.load(state_file).get('source')
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return paths
+        if not source or source not in paths:
+            return paths
+
+        desired_matte = (
+            self._resolve_matte_for(source, os.path.basename(source))
+            or 'none'
+        )
+        standby_matte = self.matte or 'none'
+        if desired_matte != standby_matte:
+            return paths
+
+        full_path = os.path.join(self.media_root, source)
+        if not os.path.isfile(full_path):
+            return paths
+        record = {
+            'content_id': self.standby_content_id,
+            'modified': self.get_last_updated(
+                os.path.basename(source),
+                full_path,
+            ),
+            'path_rel': source,
+            'matte': standby_matte,
+        }
+        record.update(self._get_file_signature(full_path))
+        if self.standby_image_date is not None:
+            record['image_date'] = self.standby_image_date
+        self.uploaded_files[source] = record
+        self.write_program_data()
+        self.log.info(
+            'Reusing dynamic standby %s as slideshow content %s',
+            self.standby_content_id,
+            source,
+        )
+        return [path for path in paths if path != source]
+
     def close(self):
         '''
         exit on signal
