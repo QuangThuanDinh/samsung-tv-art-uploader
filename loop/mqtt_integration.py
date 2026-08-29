@@ -193,7 +193,7 @@ class MQTTIntegrationMixin:
                     if not os.path.isdir(dp):
                         continue
                     for f in os.listdir(dp):
-                        if f.lower().endswith(('.jpg','.jpeg','.png')) and f != 'standby.png':
+                        if f.lower().endswith(('.jpg','.jpeg','.png')):
                             csv_data[f'{d}/{f}'] = {'artwork_title': f, 'artwork_dir': d}
             except Exception:
                 pass
@@ -1032,7 +1032,6 @@ class MQTTIntegrationMixin:
                     image_files = [
                         f for f in raw_files
                         if f.lower().endswith(('.jpg', '.jpeg', '.png'))
-                        and f not in ('standby.png',)
                     ]
                     files = self.museum_labels.preferred_filenames(
                         coll_path,
@@ -1108,7 +1107,7 @@ class MQTTIntegrationMixin:
         """Apply a specific image selection to the TV.
         Normal applies retain matching cached uploads and change only missing,
         modified, re-matted, or deselected uploader-managed images. Forced
-        applies delete all TV user uploads except standby and upload every path.
+        applies delete all TV user uploads and upload every path.
         When max_uploads is provided, persists the new limit to overrides.env.
         """
         def ack(status, msg):
@@ -1164,7 +1163,6 @@ class MQTTIntegrationMixin:
             self.shown_content_ids = set()
             self._last_slideshow_paths = set(paths)
             self._save_slideshow_override()
-            self._prepare_dynamic_standby(preferred_paths=paths)
             self._publish_slideshow_state()
 
             if self.tv is None or not await self.safe_in_artmode(allow_during_refresh=True):
@@ -1183,23 +1181,58 @@ class MQTTIntegrationMixin:
                 for entry in live_entries
                 if isinstance(entry, dict) and entry.get('content_id')
             }
+            selection_applied = False
 
             if force_reupload:
                 self._publish_slideshow_state()
                 ack('progress', 'Preparing TV for full re-upload...')
-                await self.ensure_standby_selected(preferred_paths=paths)
-                if not self.standby_content_id:
-                    raise RuntimeError('Standby image is unavailable; full re-upload cancelled')
-                await self.tv.select_image(self.standby_content_id)
-                self._publish_mqtt_state('Standby', 'standby.png', None)
-                ack('progress', 'Removing all user-uploaded images from TV...')
-                if not await self.cleanup_old_uploads(protect_current=False):
-                    raise RuntimeError('Unable to remove existing TV uploads')
-                # Once destructive cleanup succeeds, an interrupted upload can
-                # recover incrementally without deleting successful retries.
+                old_content_ids = set(live_by_id)
+                previous_content_by_path = {
+                    record.get('path_rel', key): record.get('content_id')
+                    for key, record in self.uploaded_files.items()
+                }
+                ack('progress', f'Uploading {len(paths)} replacement image(s)...')
+                uploaded_count = await self.upload_files(paths)
+                if uploaded_count != len(paths):
+                    current_content_by_path = {
+                        record.get('path_rel', key): record.get('content_id')
+                        for key, record in self.uploaded_files.items()
+                    }
+                    replaced_old_ids = {
+                        previous_content_by_path.get(path)
+                        for path in paths
+                        if (
+                            current_content_by_path.get(path)
+                            and current_content_by_path.get(path)
+                            != previous_content_by_path.get(path)
+                        )
+                    }
+                    self._queue_pending_delete_ids(replaced_old_ids)
+                    raise RuntimeError(
+                        f'Only {uploaded_count} of {len(paths)} replacement image(s) uploaded'
+                    )
+                new_content_ids = {
+                    record.get('content_id')
+                    for key, record in self.uploaded_files.items()
+                    if (record.get('path_rel') or key) in set(paths)
+                    and record.get('content_id') not in old_content_ids
+                }
+                if len(new_content_ids) != len(paths):
+                    raise RuntimeError('Unable to verify all replacement uploads')
+                for key, record in list(self.uploaded_files.items()):
+                    if record.get('content_id') in old_content_ids:
+                        self.uploaded_files.pop(key, None)
+                self.write_program_data()
+                self._queue_pending_delete_ids(old_content_ids)
+                await self._select_replacement(new_content_ids)
+                selection_applied = True
+                delete_ids = old_content_ids - new_content_ids
+                if delete_ids:
+                    ack('progress', f'Removing {len(delete_ids)} replaced image(s)...')
+                await self._drain_pending_delete_ids()
                 self.slideshow_override_force_reupload = False
                 self._save_slideshow_override()
-                to_upload = self.reuse_dynamic_standby_upload(paths)
+                to_upload = []
             else:
                 desired_paths = set(paths)
                 cached_by_path = {
@@ -1209,7 +1242,7 @@ class MQTTIntegrationMixin:
                 to_upload = self._slideshow_paths_requiring_upload(paths)
                 to_upload_set = set(to_upload)
                 delete_records = []
-                stale_keys = []
+                stale_records = {}
                 cache_metadata_changed = False
 
                 for path, (key, record) in cached_by_path.items():
@@ -1219,7 +1252,7 @@ class MQTTIntegrationMixin:
                         record,
                         live_by_id,
                     ):
-                        stale_keys.append(key)
+                        stale_records[key] = record
                         if path in desired_paths and path not in to_upload_set:
                             to_upload.append(path)
                             to_upload_set.add(path)
@@ -1240,27 +1273,72 @@ class MQTTIntegrationMixin:
                                 pass
                             cache_metadata_changed = True
 
-                for key in stale_keys:
-                    self.uploaded_files.pop(key, None)
-
                 if delete_records or to_upload:
                     self._publish_slideshow_state()
 
+                delete_ids = {content_id for _, _, content_id in delete_records}
+                if to_upload:
+                    ack('progress', f'Uploading {len(to_upload)} missing or changed image(s)...')
+                    await self.upload_files(to_upload)
+                    await asyncio.sleep(2)
+                    remaining = self._slideshow_paths_requiring_upload(paths)
+                    if remaining:
+                        remaining_paths = set(remaining)
+                        replaced_old_ids = {
+                            content_id
+                            for _, path, content_id in delete_records
+                            if path not in desired_paths or path not in remaining_paths
+                        }
+                        self._queue_pending_delete_ids(replaced_old_ids)
+                        raise RuntimeError(
+                            f'{len(remaining)} replacement image(s) failed to upload'
+                        )
+                    to_upload = []
+
                 if delete_records:
                     ack('progress', f'Removing {len(delete_records)} changed or unselected image(s)...')
-                    await self.ensure_standby_selected(preferred_paths=paths)
-                    if not self.standby_content_id:
-                        raise RuntimeError('Standby image is unavailable; selective update cancelled')
-                    await self.tv.select_image(self.standby_content_id)
-                    self._publish_mqtt_state('Standby', 'standby.png', None)
+                    self._queue_pending_delete_ids(delete_ids)
                     for key, path, content_id in delete_records:
-                        await self.tv.delete_list([content_id])
-                        self.uploaded_files.pop(key, None)
-                        self.write_program_data()
-                        self.log.info('Removed cached TV upload: %s (%s)', path, content_id)
-                        await asyncio.sleep(self.delete_delay_seconds)
-                    await asyncio.sleep(self.post_delete_recovery_seconds)
-                elif stale_keys or cache_metadata_changed:
+                        current_record = self.uploaded_files.get(key)
+                        if (
+                            current_record
+                            and current_record.get('content_id') == content_id
+                        ):
+                            self.uploaded_files.pop(key, None)
+                        self.log.info('Removing replaced TV upload: %s (%s)', path, content_id)
+                    for key, stale_record in stale_records.items():
+                        current_record = self.uploaded_files.get(key)
+                        if (
+                            current_record is stale_record
+                            or (
+                                current_record
+                                and current_record.get('content_id')
+                                == stale_record.get('content_id')
+                            )
+                        ):
+                            self.uploaded_files.pop(key, None)
+                    self.write_program_data()
+                    desired_content_ids = {
+                        record.get('content_id')
+                        for key, record in self.uploaded_files.items()
+                        if (record.get('path_rel') or key) in desired_paths
+                        and record.get('content_id') not in delete_ids
+                    }
+                    await self._select_replacement(desired_content_ids)
+                    selection_applied = True
+                    await self._drain_pending_delete_ids()
+                elif stale_records or cache_metadata_changed:
+                    for key, stale_record in stale_records.items():
+                        current_record = self.uploaded_files.get(key)
+                        if (
+                            current_record is stale_record
+                            or (
+                                current_record
+                                and current_record.get('content_id')
+                                == stale_record.get('content_id')
+                            )
+                        ):
+                            self.uploaded_files.pop(key, None)
                     self.write_program_data()
 
             if to_upload:
@@ -1272,7 +1350,7 @@ class MQTTIntegrationMixin:
             if remaining:
                 should_retry = not await self.safe_in_artmode(allow_during_refresh=True)
                 self.slideshow_override_pending = should_retry
-                if not should_retry:
+                if not should_retry and not force_reupload:
                     self.slideshow_override_force_reupload = False
                 self._save_slideshow_override()
                 self._publish_slideshow_state()
@@ -1294,7 +1372,9 @@ class MQTTIntegrationMixin:
             self.slideshow_override_force_reupload = False
             self._save_slideshow_override()
             self._publish_slideshow_state()
-            await self.change_art()
+            if not selection_applied:
+                await self.change_art()
+            await self._drain_pending_delete_ids()
             if work_started:
                 self.start = time.time()
                 self.write_program_data()
@@ -1303,7 +1383,7 @@ class MQTTIntegrationMixin:
             self.log.warning('Error applying selection: %s', e)
             should_retry = self.tv is not None and not await self.safe_in_artmode(allow_during_refresh=True)
             self.slideshow_override_pending = should_retry
-            if not should_retry:
+            if not should_retry and not force_reupload:
                 self.slideshow_override_force_reupload = False
             self._save_slideshow_override()
             ack('error', str(e))
@@ -2299,7 +2379,6 @@ class MQTTIntegrationMixin:
 
         self._publish_ack(ack_cmd, 'progress', 'Reloading collection metadata...', req_id)
         self._load_csv_metadata()
-        self._prepare_dynamic_standby()
         self._publish_collections_state()
         self._publish_selected_collections_state()
         self._publish_settings_state()

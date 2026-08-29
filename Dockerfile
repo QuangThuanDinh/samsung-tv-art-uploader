@@ -22,16 +22,15 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+RUN mkdir -p /app/frame_tv_art_collections
 COPY start.sh /app/start.sh
 COPY loop/ /app/loop/
 COPY scripts/ /app/scripts/
 COPY assets/fonts/ /app/assets/fonts/
 RUN chmod +x /app/scripts/*.sh || true
 
-# Web UI and standby artwork baked into the image
+# Web UI baked into the image
 COPY www/ /app/www/
-COPY assets/standby.png /app/frame_tv_art_collections/standby.png
-COPY assets/standby.png /app/standby.default.png
 
 RUN chmod +x /app/start.sh
 

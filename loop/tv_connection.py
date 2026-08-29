@@ -54,6 +54,8 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
         self._start_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
         self._heartbeat_task = None
+        self._suppress_disconnect_log = False
+        self._active_listener = None
         self._ready_timeout = self._read_positive_seconds(
             'SAMSUNG_TV_ART_READY_TIMEOUT_SECONDS',
             10,
@@ -87,6 +89,8 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
     async def open(self):
         if self._retired:
             raise ConnectionError('retired TV WebSocket cannot be reopened')
+        self._suppress_disconnect_log = False
+        self._active_listener = None
         self._channel_id = None
         self._channel_ready.clear()
         return await SamsungTVWSAsyncConnection.open(self)
@@ -140,6 +144,9 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
                 self,
                 self.process_event,
             )
+            if started and self._recv_loop is not None:
+                self._active_listener = self._recv_loop
+                self._recv_loop.add_done_callback(self._on_listener_done)
             try:
                 await asyncio.wait_for(
                     self._channel_ready.wait(),
@@ -174,7 +181,33 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
         ):
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
+    def _on_listener_done(self, listener):
+        if (
+            self._suppress_disconnect_log
+            or self._retired
+            or listener is not self._active_listener
+            or not self._channel_ready.is_set()
+        ):
+            return
+        if listener.cancelled():
+            reason = 'listener cancelled'
+        else:
+            exception = listener.exception()
+            reason = (
+                f'{type(exception).__name__}: {exception}'
+                if exception
+                else 'listener stopped'
+            )
+        self._response_logger.info(
+            'TV Art WebSocket disconnected (%s)',
+            reason,
+        )
+        self._channel_id = None
+        self._channel_ready.clear()
+        self._active_listener = None
+
     async def close(self):
+        self._suppress_disconnect_log = True
         heartbeat_task = self._heartbeat_task
         self._heartbeat_task = None
         if (
@@ -189,6 +222,7 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
         finally:
             self._channel_id = None
             self._channel_ready.clear()
+            self._active_listener = None
 
     async def _heartbeat_loop(self):
         interval = self._read_positive_seconds(
@@ -209,8 +243,8 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._response_logger.warning(
-                'TV Art WebSocket heartbeat failed (%s): %s',
+            self._response_logger.info(
+                'TV Art WebSocket disconnected: heartbeat failed (%s): %s',
                 type(exc).__name__,
                 exc,
             )

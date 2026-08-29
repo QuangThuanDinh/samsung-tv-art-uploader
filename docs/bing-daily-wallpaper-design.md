@@ -123,12 +123,10 @@ While daily mode is active:
 - Verify that the expected image is represented by a valid cached upload on the
   TV.
 - If the current daily image is not on the TV:
-  1. Select or upload standby as required by the existing safe replacement
-     workflow.
-  2. Delete all other user-uploaded slideshow images.
-  3. Upload the one current Bing image.
-  4. Select that image once the upload completes.
-  5. Persist its TV content ID and file signature in the normal upload cache.
+  1. Upload the one current Bing image.
+  2. Select that image once the upload completes.
+  3. Delete the replaced user-uploaded slideshow images.
+  4. Persist its TV content ID and file signature in the normal upload cache.
 - If the expected image is already on the TV, do not upload it again.
 - Do not repeatedly re-select the image on every loop iteration.
 - Once today's cached entry is known to be the image already uploaded to the TV,
@@ -173,8 +171,8 @@ Bing-specific behavior:
   or `failed`.
 
 The manager receives the uploader host through constructor injection. It may
-call narrow, existing uploader operations for Art Mode checks, standby
-selection, cleanup, upload, selection, cache persistence, and MQTT publication.
+call narrow, existing uploader operations for Art Mode checks, cleanup, upload,
+selection, cache persistence, and MQTT publication.
 It must not duplicate Samsung TV protocol logic.
 
 Suggested result model:

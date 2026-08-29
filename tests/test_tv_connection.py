@@ -21,8 +21,10 @@ class LoggingSamsungTVAsyncArtTests(unittest.IsolatedAsyncioTestCase):
         client._start_lock = asyncio.Lock()
         client._request_lock = asyncio.Lock()
         client._heartbeat_task = None
+        client._suppress_disconnect_log = False
         client._ready_timeout = 1.0
         client._recv_loop = mock.Mock(done=mock.Mock(return_value=False))
+        client._active_listener = client._recv_loop
         client.is_alive = mock.Mock(return_value=True)
         client.pending_requests = {}
         client.art_uuid = 'initial-uuid'
@@ -127,6 +129,42 @@ class LoggingSamsungTVAsyncArtTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response['value'], 'off')
         self.assertEqual(client.pending_requests, {})
+
+    def test_passive_listener_disconnect_is_logged_at_info(self):
+        client = self.make_client()
+        listener = client._active_listener
+        listener.cancelled.return_value = False
+        listener.exception.return_value = ConnectionError('socket closed')
+
+        client._on_listener_done(listener)
+
+        client._response_logger.info.assert_called_once_with(
+            'TV Art WebSocket disconnected (%s)',
+            'ConnectionError: socket closed',
+        )
+        self.assertIsNone(client._channel_id)
+        self.assertFalse(client._channel_ready.is_set())
+
+    def test_intentional_listener_close_is_not_logged(self):
+        client = self.make_client()
+        client._suppress_disconnect_log = True
+
+        client._on_listener_done(mock.Mock())
+
+        client._response_logger.info.assert_not_called()
+
+    def test_completed_listener_disconnect_is_logged_at_info(self):
+        client = self.make_client()
+        listener = client._active_listener
+        listener.cancelled.return_value = False
+        listener.exception.return_value = None
+
+        client._on_listener_done(listener)
+
+        client._response_logger.info.assert_called_once_with(
+            'TV Art WebSocket disconnected (%s)',
+            'listener stopped',
+        )
 
 
 if __name__ == '__main__':

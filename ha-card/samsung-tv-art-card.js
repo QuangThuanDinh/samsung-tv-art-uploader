@@ -1,5 +1,5 @@
 /**
- * Frame TV Art Card v0.4.1
+ * Frame TV Art Card v0.4.2
  *
  * Viewer-only card. Displays the currently selected artwork with metadata
  * (title / artist / year / medium / description) and a "TV not in art mode"
@@ -16,14 +16,6 @@ class FrameTVArtCard extends HTMLElement {
     this._config = {};
     this._hass = null;
     this._lastStateHash = '';
-    this._logLines = [];   // rolling buffer of frame_tv/log lines (shown during standby)
-    this._logUnsubscribe = null;
-    this._logSubscribing = false;
-    // Sticky: once a subscribe attempt is rejected (e.g. non-admin user without
-    // `mqtt/subscribe` permission), don't try again for the lifetime of this card.
-    // Otherwise every hass state tick would re-issue the failing WS command
-    // (~25/min) and flood the HA auth log.
-    this._logSubFailed = false;
   }
 
   setConfig(config) {
@@ -35,7 +27,6 @@ class FrameTVArtCard extends HTMLElement {
         config.selected_artwork_file_entity || 'sensor.frame_tv_art_selected_artwork',
       // Base path for thumbnail images (mirrors of the on-disk collections)
       image_path: config.image_path || '/local/images/frame_tv_art_collections',
-      standby_image_path: config.standby_image_path,
       // URL of the standalone Samsung TV Art Uploader web UI. The cog opens this.
       web_ui_url: config.web_ui_url || 'http://samsung-tv-art.local:8080',
       // 'fixed' = 16:9 compressed; 'dynamic' = grows with content
@@ -51,12 +42,6 @@ class FrameTVArtCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    // Always-on subscription so the rolling log buffer captures messages emitted
-    // before standby is visible (the backend logs during the work that *causes*
-    // standby — subscribing only once standby appears would miss those lines).
-    // The sticky `_logSubFailed` flag inside ensures non-admin users that get
-    // rejected by `mqtt/subscribe` don't retry on every hass tick.
-    this._ensureLogSubscription();
     const newHash = this._getStateHash();
     if (newHash === this._lastStateHash) return;
     this._lastStateHash = newHash;
@@ -68,60 +53,6 @@ class FrameTVArtCard extends HTMLElement {
     const artAttrs = this._getAttrs(this._config.selected_artwork_file_entity);
     const inArtMode = artAttrs ? String(artAttrs.in_art_mode) : 'true';
     return `${file}|${inArtMode}`;
-  }
-
-  disconnectedCallback() {
-    this._teardownLogSubscription();
-  }
-
-  _teardownLogSubscription() {
-    if (typeof this._logUnsubscribe === 'function') {
-      try { this._logUnsubscribe(); } catch (_) {}
-    }
-    this._logUnsubscribe = null;
-    this._logSubscribing = false;
-  }
-
-  _ensureLogSubscription() {
-    if (!this._hass || !this._hass.connection) return;
-    if (this._logSubscribing || this._logUnsubscribe) return;
-    if (this._logSubFailed) return;  // don't retry after a permission failure
-    this._logSubscribing = true;
-    this._hass.connection
-      .subscribeMessage(
-        (msg) => {
-          const raw = (msg && (msg.payload || msg)) || '';
-          const s = typeof raw === 'string' ? raw.trim() : JSON.stringify(raw);
-          if (!s) return;
-          this._logLines.push(s);
-          if (this._logLines.length > 60) this._logLines.shift();
-          // Only render new log lines into the live element when we're showing the
-          // standby state (the log element only exists then).
-          if (this._isStandbyLike) {
-            const logEl = this.querySelector('.ftv-refresh-log');
-            if (logEl) {
-              logEl.innerHTML = this._logLines.map((l) => this._logLineHtml(l)).join('');
-              requestAnimationFrame(() => { logEl.scrollTop = logEl.scrollHeight; });
-            }
-          }
-        },
-        { type: 'mqtt/subscribe', topic: 'frame_tv/log' }
-      )
-      .then((unsub) => { this._logUnsubscribe = unsub; })
-      .catch((err) => {
-        // Only set the sticky lockout for permission errors. Any other failure
-        // (transient WS hiccup on page load, etc.) should be allowed to retry
-        // on the next hass tick — otherwise a single hiccup permanently kills
-        // log streaming for the lifetime of the card.
-        const code = err && (err.code || err.error_code);
-        const msg = String((err && (err.message || err.code)) || '').toLowerCase();
-        if (code === 'unauthorized' || msg.includes('unauth') || msg.includes('not allowed') || msg.includes('admin')) {
-          this._logSubFailed = true;
-        }
-        // eslint-disable-next-line no-console
-        try { console.warn('[frame-tv-art-card] mqtt/subscribe failed:', err); } catch (_) {}
-      })
-      .finally(() => { this._logSubscribing = false; });
   }
 
   _getState(entityId) {
@@ -196,14 +127,6 @@ class FrameTVArtCard extends HTMLElement {
     return { artist, title, year };
   }
 
-  _logLineHtml(line) {
-    const l = line.toLowerCase();
-    const color = l.includes(':error:') || l.startsWith('error') ? '#ff6b6b'
-                : l.includes(':warning:') || l.startsWith('warning') ? '#ffd166'
-                : '#6bcb77';
-    return `<div style="color:${color}">${this._escapeHtml(line)}</div>`;
-  }
-
   _escapeHtml(text) {
     if (text == null) return '';
     return String(text)
@@ -231,10 +154,7 @@ class FrameTVArtCard extends HTMLElement {
     const entityId = this._config.selected_artwork_file_entity;
     const { file } = this._getSelectedData();
     const attrs = this._getAttrs(entityId);
-    if (!file || file === 'unknown' || file === 'unavailable' || file === 'None' || file === '' || file === 'standby.png') {
-      if (this._config.standby_image_path) return this._config.standby_image_path;
-      return `${this._getBaseImagePath()}/standby.png`;
-    }
+    if (!file || file === 'unknown' || file === 'unavailable' || file === 'None' || file === '') return null;
     if (attrs && attrs.artwork_dir) {
       return `${this._getBaseImagePath()}/${encodeURIComponent(attrs.artwork_dir)}/${encodeURIComponent(file)}`;
     }
@@ -251,18 +171,18 @@ class FrameTVArtCard extends HTMLElement {
     return null;
   }
 
-  _buildArtworkText(file, isStandby) {
+  _buildArtworkText(file, isUnavailable) {
     const attrs = this._getAttrs(this._config.selected_artwork_file_entity);
     const normalizedFile = String(file || '').trim().toLowerCase();
-    const standbyLike =
-      isStandby || !normalizedFile || normalizedFile === 'unknown' ||
+    const unavailable =
+      isUnavailable || !normalizedFile || normalizedFile === 'unknown' ||
       normalizedFile === 'unavailable' || normalizedFile === 'none';
 
-    if (isStandby && attrs && attrs.in_art_mode === false) {
+    if (isUnavailable && attrs && attrs.in_art_mode === false) {
       return 'TV is not in art mode';
     }
-    if (standbyLike) {
-      return 'Please stand by as artwork is loaded...';
+    if (unavailable) {
+      return 'Artwork is unavailable';
     }
 
     const title = attrs.artwork_title || null;
@@ -317,19 +237,17 @@ class FrameTVArtCard extends HTMLElement {
   _syncInfoFade() {
     const wrapEl = this.querySelector('.ftv-progress-wrap');
     const fadeEl = this.querySelector('.ftv-info-fade');
-    const logEl = this.querySelector('.ftv-refresh-log');
     if (!wrapEl) return;
     requestAnimationFrame(() => {
-      const scrollEl = (this._isStandbyLike && logEl && logEl.scrollHeight > 0) ? logEl : wrapEl;
-      const overflow = scrollEl.scrollHeight > scrollEl.clientHeight + 2;
+      const overflow = wrapEl.scrollHeight > wrapEl.clientHeight + 2;
       if (fadeEl) fadeEl.style.display = overflow ? '' : 'none';
       wrapEl.style.cursor = overflow ? 'pointer' : '';
       wrapEl.dataset.overflows = overflow ? '1' : '';
-      if (overflow && !scrollEl._ftv_scroll_bound) {
-        scrollEl._ftv_scroll_bound = true;
-        scrollEl.addEventListener('scroll', () => {
+      if (overflow && !wrapEl._ftv_scroll_bound) {
+        wrapEl._ftv_scroll_bound = true;
+        wrapEl.addEventListener('scroll', () => {
           if (!fadeEl) return;
-          const atBottom = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 4;
+          const atBottom = wrapEl.scrollTop + wrapEl.clientHeight >= wrapEl.scrollHeight - 4;
           fadeEl.style.display = atBottom ? 'none' : '';
         });
       }
@@ -338,7 +256,6 @@ class FrameTVArtCard extends HTMLElement {
 
   _showInfoOverlay() {
     const infoDiv = this.querySelector('.ftv-info');
-    const logDiv = this.querySelector('.ftv-refresh-log');
     const wrapEl = this.querySelector('.ftv-progress-wrap');
     if (!infoDiv) return;
     if (wrapEl) wrapEl.style.background = 'transparent';
@@ -350,7 +267,7 @@ class FrameTVArtCard extends HTMLElement {
     const close = document.createElement('button');
     close.innerHTML = '&times;';
     close.style.cssText = 'position:absolute;top:10px;right:12px;background:transparent;border:none;color:rgba(255,255,255,0.5);font-size:22px;cursor:pointer;line-height:1;padding:0;';
-    panel.innerHTML = infoDiv.innerHTML + (logDiv && logDiv.innerHTML ? '<div style="margin-top:8px;border-top:1px solid rgba(255,255,255,0.1);padding-top:8px;font-size:0.85em;line-height:1.6;color:rgba(255,255,255,0.65);">' + logDiv.innerHTML + '</div>' : '');
+    panel.innerHTML = infoDiv.innerHTML;
     panel.prepend(close);
     overlay.appendChild(panel);
     const dismiss = () => {
@@ -371,14 +288,13 @@ class FrameTVArtCard extends HTMLElement {
       ? artworkAttrs.in_art_mode !== false
       : true;
     const isNotInArtMode = !inArtMode;
-    const isStandby =
-      isNotInArtMode || !normalizedFile || normalizedFile === 'standby.png' ||
+    const isUnavailable =
+      isNotInArtMode || !normalizedFile ||
       normalizedFile === 'unknown' || normalizedFile === 'unavailable' || normalizedFile === 'none';
-    this._isStandbyLike = isNotInArtMode;
     const bgUrl = this._getBackgroundUrl();
     const hasArtwork = bgUrl !== null;
     const isCompressed = (this._config.layout_mode || 'fixed') !== 'dynamic';
-    const artworkText = this._buildArtworkText(file, isStandby);
+    const artworkText = this._buildArtworkText(file, isUnavailable);
 
     this.style.setProperty('--ha-card-border-radius', '21px');
     if (isNotInArtMode) this.style.setProperty('--ha-card-box-shadow', 'none');
@@ -450,20 +366,13 @@ class FrameTVArtCard extends HTMLElement {
           .ftv-progress-wrap {
             ${hasArtwork ? 'background: rgba(0,0,0,0.55); border-radius: 8px; transition: background 0.25s;' : ''}
             ${isCompressed ? 'flex: 1; min-height: 0; position: relative;' : (hasArtwork ? 'overflow: hidden;' : '')}
-            ${isStandby ? 'display: flex; flex-direction: column; overflow-y: hidden; padding-bottom: 8px;' : isCompressed ? 'overflow-y: auto; padding-bottom: 8px;' : ''}
+            ${isUnavailable ? 'display: flex; flex-direction: column; overflow-y: hidden; padding-bottom: 8px;' : isCompressed ? 'overflow-y: auto; padding-bottom: 8px;' : ''}
           }
           .ftv-info {
             display: block; width: 100%; box-sizing: border-box; padding: 12px;
-            ${isStandby ? 'flex: 0 0 auto;' : ''}
+            ${isUnavailable ? 'flex: 0 0 auto;' : ''}
             ${hasArtwork ? 'color: white;' : ''}
           }
-          .ftv-refresh-log {
-            font-size: 0.85em; line-height: 1.6;
-            ${isStandby ? 'flex: 1; min-height: 0; max-height: none;' : 'max-height: 200px;'}
-            overflow-y: auto;
-            ${hasArtwork ? 'padding: 0 12px 10px;' : ''}
-          }
-          .ftv-refresh-log:empty { display: none; }
           ${isCompressed ? `
           .ftv-info-fade {
             display: none; position: absolute;
@@ -493,7 +402,6 @@ class FrameTVArtCard extends HTMLElement {
           ${isNotInArtMode ? '' : `
           <div class="ftv-progress-wrap">
             <div class="ftv-info">${artworkText}</div>
-            <div class="ftv-refresh-log">${isStandby ? this._logLines.map((l) => this._logLineHtml(l)).join('') : ''}</div>
             ${isCompressed ? '<div class="ftv-info-fade"></div>' : ''}
           </div>
           `}
@@ -530,7 +438,7 @@ class FrameTVArtCard extends HTMLElement {
   }
 }
 
-console.info('%c FRAME-TV-ART-CARD %c v0.4.1 ', 'color: white; background: #03a9f4; font-weight: bold;', '');
+console.info('%c FRAME-TV-ART-CARD %c v0.4.2 ', 'color: white; background: #03a9f4; font-weight: bold;', '');
 
 try {
   if (!customElements.get('frame-tv-art-card')) {

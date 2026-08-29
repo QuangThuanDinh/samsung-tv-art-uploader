@@ -68,7 +68,6 @@ from .BingDailyWallpaperManager import (
     BingDailyWallpaperManager,
 )
 from .MuseumLabelManager import MuseumLabelManager
-from .standy_util import refresh_dynamic_standby
 from .mqtt_integration import MQTTIntegrationMixin, _MatteRejectedError
 from .pil_methods import PIL_methods
 from .tv_connection import FrameTVConnection
@@ -110,7 +109,6 @@ def parseargs():
     parser.add_argument('-D','--debug', action='store_true', default=False, help='Debug mode (default: %(default)s))')
     parser.add_argument('-e','--exclude', action="store", type=str, nargs='*', default=[], help='filenames to exclude from slideshow (default: %(default)s))')
     parser.add_argument('-E','--exclude-content-ids', action="store", type=str, nargs='*', default=[], help='content_ids to exclude from slideshow (default: %(default)s))')
-    parser.add_argument('--standby', action="store", type=str, default=None, help='filename to select as standby before starting slideshow (default: %(default)s))')
     # MQTT discovery is now the default integration path; no HA REST args
     return parser.parse_args()
     
@@ -122,13 +120,14 @@ class monitor_and_display(MQTTIntegrationMixin):
     
     allowed_ext = ['jpg', 'jpeg', 'png', 'bmp', 'tif']
     
-    def __init__(self, ip, folder, period=5, update_time=1440, include_fav=False, sync=True, matte='none', sequential=False, on=False, token_file=None, exclude=[], exclude_content_ids=[], standby=None):
+    def __init__(self, ip, folder, period=5, update_time=1440, include_fav=False, sync=True, matte='none', sequential=False, on=False, token_file=None, exclude=[], exclude_content_ids=[]):
         self.log = logging.getLogger('Main.'+__class__.__name__)
         self.debug = self.log.getEffectiveLevel() <= logging.DEBUG
         self.ip = ip
         self.folder = folder
         self.media_root = os.environ.get('SAMSUNG_TV_ART_MEDIA_ROOT', folder)
         self.cache_path = os.environ.get('SAMSUNG_TV_ART_CACHE_FILE', '/data/uploaded_files_cache.json')
+        self.pending_delete_path = '/data/pending_tv_delete_ids.json'
         self.current_key = None
         self.cache = {}
         self.selection_mtime = None
@@ -161,13 +160,6 @@ class monitor_and_display(MQTTIntegrationMixin):
         self.on = on
         self.exclude = exclude
         self.exclude_content_ids = exclude_content_ids
-        self.standby = standby
-        self.standby_content_id = None
-        self.standby_image_date = None     # TV-assigned image_date of the standby upload; used to detect content-id reuse
-        self.dynamic_standby = os.environ.get(
-            'SAMSUNG_TV_ART_DYNAMIC_STANDBY', 'false'
-        ).lower() in ('1', 'true', 'yes')
-        self.dynamic_standby_state_path = '/data/dynamic_standby_source.json'
         # Autosave token to file
         self.token_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), token_file) if token_file else token_file
         self.program_data_path = './uploaded_files.json'
@@ -402,12 +394,11 @@ class monitor_and_display(MQTTIntegrationMixin):
         self._load_slideshow_presets()
         self._load_matte_overrides()
         self._restore_cached_selection()
-        self._prepare_dynamic_standby()
         # Init MQTT if enabled
         if self.mqtt_enabled:
             self._init_mqtt()
-            # Lock the UI as early as possible.  TV connect + standby + (optional)
-            # matte probe can take many seconds; without an early uploading=true
+            # Lock the UI as early as possible. TV connect and the optional matte
+            # probe can take many seconds; without an early uploading=true
             # signal, the web UI shows slideshow controls as available during
             # this window (driven by the previous session's retained state).
             # We publish discovery + slideshow_state now so the grid locks
@@ -453,14 +444,10 @@ class monitor_and_display(MQTTIntegrationMixin):
                     self.log.error('failed to connect with TV: {}'.format(e))
                 if self.tv.is_alive():
                     try:
-                        # Determine the Art API version before the first upload so the
-                        # standby image is sent over the correct transport. Legacy Frame
-                        # TVs (e.g. Art API 0.97/1.07) need the WS-binary path, and without
-                        # this the initial ensure_standby_selected() would fail with error -1
-                        # before the version was known.
+                        # Determine the Art API version before the first upload so legacy
+                        # Frame TVs use the correct WS-binary transport.
                         await self.get_api_version()
                         await self.check_matte()
-                        await self.ensure_standby_selected()
                     except Exception as e:
                         self.log.warning('Startup TV setup error (non-fatal): %s', e)
             # Always run select_artwork — even if TV is not reachable right now,
@@ -650,168 +637,100 @@ class monitor_and_display(MQTTIntegrationMixin):
         # Failure-only retry cadence: 1, 2, 4, then every 8 seconds.
         return min(2 ** max(0, self.consecutive_failures - 1), 8)
 
-    async def cleanup_old_uploads(self, protect_current=True):
-        """Delete previously uploaded photos from the TV in small batches to avoid overwhelming it."""
-        try:
-            if not await self.safe_in_artmode(allow_during_refresh=True):
-                self.log.info('TV not in art mode, skipping cleanup')
-                return False
-
-            # Protect the currently-displayed image from deletion even if standby
-            # selection hasn't taken effect yet (e.g. slow TV or stale content_id).
-            currently_displayed = await self.get_current_artwork() if protect_current else None
-
-            my_photos = await self.get_tv_content('MY-C0002')
-            if my_photos is None:
-                self.log.warning('Cleanup aborted: unable to list TV uploads')
-                return False
-            if my_photos:
-                skip = {cid for cid in (self.standby_content_id, currently_displayed) if cid}
-                my_photos = [cid for cid in my_photos if cid not in skip]
-                if currently_displayed and currently_displayed != self.standby_content_id:
-                    self.log.info('Protecting currently-displayed image from deletion: %s', currently_displayed)
-                if my_photos:
-                    self.log.info('Cleaning up %d existing uploads from TV...', len(my_photos))
-                    # Let TV settle before starting deletions
-                    await asyncio.sleep(5)
-                    # Delete ONE AT A TIME with delays to be very gentle on TV WiFi
-                    for i, content_id in enumerate(my_photos):
-                        await self.tv.delete_list([content_id])
-                        self.log.debug('Deleted %d/%d', i + 1, len(my_photos))
-                        # Wait between each delete
-                        await asyncio.sleep(self.delete_delay_seconds)
-                    # Give TV significant time to recover after all deletions
-                    self.log.info('Waiting for TV to recover after deletions...')
-                    await asyncio.sleep(self.post_delete_recovery_seconds)
-            self.cache = {}
-            self.current_key = None
-            self.uploaded_files = {}  # cleared from TV; force clean slate for add_files headroom
+    async def _delete_tv_upload_ids(self, content_ids):
+        """Delete known old uploads after replacement artwork is active."""
+        content_ids = list(dict.fromkeys(cid for cid in content_ids if cid))
+        if not content_ids:
+            return
+        self.log.info('Cleaning up %d replaced upload(s) from TV...', len(content_ids))
+        failed = []
+        referenced_ids = {
+            record.get('content_id')
+            for record in self.uploaded_files.values()
+            if record.get('content_id')
+        }
+        for index, content_id in enumerate(content_ids):
+            if (
+                content_id == self.current_content_id
+                or content_id in referenced_ids
+            ):
+                failed.append(content_id)
+                self.log.warning(
+                    'Deferring deletion of active or referenced artwork: %s',
+                    content_id,
+                )
+                continue
             try:
-                if os.path.isfile(self.cache_path):
-                    os.remove(self.cache_path)
-            except Exception as e:
-                self.log.warning('Failed to remove cache file: %s', e)
-            # The standby image is protected from deletion above, so its content id is
-            # still valid on the TV. Re-persist it after the cache wipe so standby
-            # dedup survives — otherwise the id written by ensure_standby_selected()
-            # (which runs just before cleanup) is lost and standby is re-uploaded on
-            # every restart.
-            if self.standby_content_id:
-                self._cache_standby_content_id(self.standby_content_id, self.standby_image_date)
-            return True
-        except Exception as e:
-            self.log.warning('Failed to cleanup uploads: %s', e)
-            return False
+                await self.tv.delete_list([content_id])
+                self.log.debug('Deleted %d/%d', index + 1, len(content_ids))
+            except Exception as exc:
+                failed.append(content_id)
+                self.log.warning(
+                    'Failed to delete replaced upload %s: %s',
+                    content_id,
+                    exc,
+                )
+            if index < len(content_ids) - 1:
+                await asyncio.sleep(self.delete_delay_seconds)
+        self._save_pending_delete_ids(failed)
+        if len(failed) != len(content_ids):
+            self.log.info('Waiting for TV to recover after deletions...')
+            await asyncio.sleep(self.post_delete_recovery_seconds)
 
-    def _prepare_dynamic_standby(self, preferred_paths=None):
-        """Delegate local standby generation and invalidate stale TV cache state."""
+    def _load_pending_delete_ids(self):
         try:
-            standby_changed = refresh_dynamic_standby(
-                enabled=self.dynamic_standby,
-                media_root=self.media_root,
-                standby=self.standby,
-                state_path=self.dynamic_standby_state_path,
-                allowed_extensions=self.allowed_ext,
-                selected_collections=self.selected_collections,
-                cached_selected_collections=self._read_cached_selected_collections(),
-                slideshow_override=self.slideshow_override,
-                preferred_paths=preferred_paths,
-                map_collection=self._map_to_artwork_dir,
-                log=self.log,
-            )
-            if standby_changed:
-                previous_content_id = self.standby_content_id
-                self.standby_content_id = None
-                self.standby_image_date = None
-                self._cache_standby_content_id(None, None)
-                if previous_content_id:
-                    self.log.info(
-                        'Standby: source changed; invalidated cached TV content ID %s',
-                        previous_content_id,
-                    )
-        except Exception as e:
-            self.log.warning('Standby: dynamic image update failed; using existing image: %s', e)
-            return False
-        return standby_changed
+            with open(self.pending_delete_path, 'r', encoding='utf-8') as source:
+                value = json.load(source)
+            return {
+                content_id
+                for content_id in value
+                if isinstance(content_id, str) and content_id
+            }
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+            return set()
 
-    async def ensure_standby_selected(self, preferred_paths=None):
-        """Upload and select standby image if present.
-        Idempotent: skips the upload when the standby is already active in this session,
-        but first verifies the cached standby content_id still exists on the TV. The Frame
-        can drop/renumber MY_F#### ids (purge, reboot, content-id reuse), which would leave
-        a stale id that now resolves to a random leftover artwork; when that happens we clear
-        the id and re-upload a fresh standby so 'standby' always maps to standby.png.
-        """
-        if not self.standby:
-            self.log.info('Standby: disabled; no standby path is configured')
-            return
-        self.log.info(
-            'Standby: preparing image (dynamic=%s)',
-            'enabled' if self.dynamic_standby else 'disabled',
-        )
-        self._prepare_dynamic_standby(preferred_paths)
-        standby_path = self.standby if os.path.isabs(self.standby) else os.path.join(self.media_root, self.standby)
-        if not os.path.isfile(standby_path):
-            self.log.warning('Standby: file not found on disk: %s', standby_path)
-            return
-        # Restore the standby id from the persistent cache so we don't re-upload a
-        # fresh standby on every restart (the id lives only in memory otherwise).
-        if not self.standby_content_id:
-            self.standby_content_id, self.standby_image_date = self._load_standby_content_id()
-        if self.standby_content_id:
-            # Validate the cached id against the TV's live My-Collection list. Match on
-            # both content_id AND image_date: the Frame can free and later reuse a
-            # MY_F#### id for a different upload, so a present id alone isn't proof it's
-            # still our standby. Only invalidate on a definitive mismatch — a None list
-            # means the query failed and we must not blow away a still-valid id.
-            entries = await self.get_tv_content_entries('MY-C0002')
-            if entries is not None:
-                match = next((e for e in entries if e.get('content_id') == self.standby_content_id), None)
-                reused = bool(match and self.standby_image_date and match.get('image_date')
-                              and match.get('image_date') != self.standby_image_date)
-                if match is None or reused:
-                    reason = 'content-id reused by a different image' if reused else 'no longer on the TV'
-                    self.log.warning('Standby: cached ID %s is stale (%s); uploading again', self.standby_content_id, reason)
-                    self.standby_content_id = None
-                    self.standby_image_date = None
-                    self._cache_standby_content_id(None, None)
-                else:
-                    self.log.info('Standby: already uploaded as %s; skipping upload', self.standby_content_id)
-                    return
-            else:
-                self.log.info('Standby: TV validation unavailable; retaining cached ID %s', self.standby_content_id)
+    def _save_pending_delete_ids(self, content_ids):
+        content_ids = sorted(set(content_ids))
+        try:
+            if not content_ids:
+                if os.path.isfile(self.pending_delete_path):
+                    os.remove(self.pending_delete_path)
                 return
-        try:
-            self.log.info('Standby: reading and preparing %s for TV upload', standby_path)
-            file_data, file_type = self.read_file(standby_path)
-            if file_data and self.tv.art_mode:
-                self.log.info('Standby: uploading image to TV')
-                # self.tv.art_mode is True here (last-known WebSocket state), so we
-                # know the TV is in art mode.  Record this immediately so the
-                # _publish_mqtt_state below carries in_art_mode: true instead of
-                # the stale bool(None)=false that would otherwise be retained
-                # until safe_in_artmode() finally succeeds.
-                self._in_art_mode = True
-                content_id = await self._upload_to_tv(file_data, file_type, self.matte)
-                if content_id:
-                    self.standby_content_id = content_id
-                    # Capture the TV-assigned image_date so a later restart can tell this
-                    # exact upload apart from a reused content_id.
-                    self.standby_image_date = await self._get_standby_image_date(content_id)
-                    self._cache_standby_content_id(content_id, self.standby_image_date)
-                    await self.tv.select_image(content_id)
-                    # Publish standby via MQTT if enabled
-                    if self.mqtt_enabled:
-                        self._publish_mqtt_discovery()
-                        self._publish_mqtt_state('Standby', 'standby.png', os.path.basename(os.path.dirname(standby_path)) or None)
-                    self.log.info('Standby: selected on TV as content ID %s', content_id)
-            elif not file_data:
-                self.log.warning('Standby: image preparation returned no data')
-            else:
-                self.log.info('Standby: TV is not in Art Mode; upload deferred')
-        except Exception as e:
-            self._warn_upload_compat(e)
-            self.log.warning('Standby: upload or selection failed: %s', e)
+            temp_path = self.pending_delete_path + '.tmp'
+            with open(temp_path, 'w', encoding='utf-8') as output:
+                json.dump(content_ids, output)
+            os.replace(temp_path, self.pending_delete_path)
+        except OSError as exc:
+            self.log.warning('Failed to persist pending TV deletions: %s', exc)
+
+    def _queue_pending_delete_ids(self, content_ids):
+        pending = self._load_pending_delete_ids()
+        pending.update(content_id for content_id in content_ids if content_id)
+        self._save_pending_delete_ids(pending)
+
+    async def _select_replacement(self, content_ids):
+        content_ids = set(content_ids)
+        target = next(
+            (
+                content_id
+                for content_id in self.get_content_ids()
+                if content_id in content_ids
+            ),
+            None,
+        )
+        if not target:
+            raise RuntimeError('No uploaded replacement artwork is available')
+        if target != self.current_content_id:
+            await self.tv.select_image(target)
+            self.current_content_id = target
+            self.shown_content_ids.add(target)
+            await self.update_ha_selected_artwork(target)
+        return target
+
+    async def _drain_pending_delete_ids(self):
+        pending = self._load_pending_delete_ids()
+        if pending:
+            await self._delete_tv_upload_ids(pending)
 
     def get_selected_folder(self):
         """Return selected folder based on MQTT-driven selection.
@@ -926,71 +845,6 @@ class monitor_and_display(MQTTIntegrationMixin):
         except Exception as e:
             self.log.warning('Failed to cache selected_collections: %s', e)
 
-    def _load_standby_content_id(self):
-        try:
-            self.load_cache()
-            return self.cache.get('_standby_content_id'), self.cache.get('_standby_image_date')
-        except Exception:
-            return None, None
-
-    def _cache_standby_content_id(self, content_id, image_date=None):
-        try:
-            self.load_cache()
-            self.cache['_standby_content_id'] = content_id
-            self.cache['_standby_image_date'] = image_date
-            self.save_cache()
-        except Exception as e:
-            self.log.warning('Failed to cache standby content_id: %s', e)
-
-    def reuse_dynamic_standby_upload(self, paths):
-        """Reuse the protected dynamic standby when its source is in the slideshow."""
-        paths = list(paths)
-        if not self.dynamic_standby or not self.standby_content_id:
-            return paths
-        try:
-            with open(
-                self.dynamic_standby_state_path,
-                'r',
-                encoding='utf-8',
-            ) as state_file:
-                source = json.load(state_file).get('source')
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return paths
-        if not source or source not in paths:
-            return paths
-
-        desired_matte = (
-            self._resolve_matte_for(source, os.path.basename(source))
-            or 'none'
-        )
-        standby_matte = self.matte or 'none'
-        if desired_matte != standby_matte:
-            return paths
-
-        full_path = os.path.join(self.media_root, source)
-        if not os.path.isfile(full_path):
-            return paths
-        record = {
-            'content_id': self.standby_content_id,
-            'modified': self.get_last_updated(
-                os.path.basename(source),
-                full_path,
-            ),
-            'path_rel': source,
-            'matte': standby_matte,
-        }
-        record.update(self._get_file_signature(full_path))
-        if self.standby_image_date is not None:
-            record['image_date'] = self.standby_image_date
-        self.uploaded_files[source] = record
-        self.write_program_data()
-        self.log.info(
-            'Reusing dynamic standby %s as slideshow content %s',
-            self.standby_content_id,
-            source,
-        )
-        return [path for path in paths if path != source]
-
     def close(self):
         '''
         exit on signal
@@ -1008,8 +862,8 @@ class monitor_and_display(MQTTIntegrationMixin):
         checks api version to see if it's old (<2021) or new type
         sets api_version to 0 for old, and 1 for new
 
-        Idempotent: this is queried early (before the first standby upload) and again
-        from initialize(); once the version is known we skip the redundant TV request.
+        Idempotent: this may be queried before initialization; once the version is
+        known we skip the redundant TV request.
         A previous failure leaves api_version_str unset so a later call can retry.
         '''
         if self.api_version_str is not None:
@@ -1136,32 +990,20 @@ class monitor_and_display(MQTTIntegrationMixin):
         await self.get_api_version()
         self.current_content_id = await self.get_current_artwork()
         self.log.info('Current artwork is: {}'.format(self.current_content_id))
-        # Publish current state at startup to avoid stale retained values.
-        # Skip when standby was just selected — ensure_standby_selected already published
-        # the correct 'Standby' state.  Polling the TV here can return the old artwork
-        # content_id (display-switch lag) and would overwrite the correct retained message.
-        if not self.standby_content_id:
-            # If art mode hasn't been confirmed True yet, do one more check before
-            # publishing.  The Samsung TV WebSocket can return an empty response to
-            # the very first in_artmode() query right after a fresh connection
-            # (seen most often on container restart), which makes cleanup_old_uploads()
-            # set _in_art_mode=False and return early.  A single retry here, after a
-            # brief pause for the TV WS to stabilise, usually gets the correct state
-            # and prevents a spurious in_art_mode:false from being written to the
-            # retained MQTT topic — which is what causes the "not in art mode" flash
-            # on the web UI / HA card after container reboots.
-            if self._in_art_mode is not True and self.tv is not None:
-                try:
-                    await asyncio.sleep(1)
-                    await self.safe_in_artmode()
-                except Exception:
-                    pass
+        # If art mode hasn't been confirmed True yet, do one more check before
+        # publishing to avoid a transient false state immediately after connection.
+        if self._in_art_mode is not True and self.tv is not None:
             try:
-                await self._publish_current_artwork_state(force=True)
+                await asyncio.sleep(1)
+                await self.safe_in_artmode()
             except Exception:
                 pass
+        try:
+            await self._publish_current_artwork_state(force=True)
+        except Exception:
+            pass
         # Fallback selection: if nothing selected via MQTT, restore cached selection
-        # or auto-select all available collections so we don't sit on standby only.
+        # or auto-select all available collections.
         try:
             if not self.selected_collections:
                 cached = self._read_cached_selected_collections()
@@ -1197,6 +1039,8 @@ class monitor_and_display(MQTTIntegrationMixin):
             # Non-fatal; continue with no selection
             pass
         self.load_program_data()
+        if self._in_art_mode is True:
+            await self._drain_pending_delete_ids()
         self.log.info('files in directory: {}: {}'.format(self.folder, self.get_folder_files()))
         if self.sync:
             if self.api_version_str in self._WS_BINARY_API_VERSIONS:
@@ -1255,8 +1099,7 @@ class monitor_and_display(MQTTIntegrationMixin):
     async def get_tv_content_entries(self, category='MY-C0002'):
         '''
         Full content entries (dicts including content_id and image_date) for a category,
-        or None on failure. Used to match a stored standby id + image_date and detect
-        content-id reuse.
+        or None on failure.
         '''
         try:
             return list(await self.tv.available(category, timeout=10))
@@ -1266,15 +1109,6 @@ class monitor_and_display(MQTTIntegrationMixin):
         except Exception as e:
             self.log.warning('failed to get contents from TV: %s', e)
             return None
-
-    async def _get_standby_image_date(self, content_id):
-        '''Return the TV-assigned image_date for content_id in My Photos, or None.'''
-        entries = await self.get_tv_content_entries('MY-C0002')
-        if entries:
-            match = next((e for e in entries if e.get('content_id') == content_id), None)
-            if match:
-                return match.get('image_date')
-        return None
 
     def get_folder_files(self):
         '''
@@ -1522,19 +1356,20 @@ class monitor_and_display(MQTTIntegrationMixin):
         except Exception:
             rel_path = None
         cache_key = rel_path or filename
+        if not content_id:
+            return
         self.uploaded_files.pop(filename, None)
         self.uploaded_files.pop(cache_key, None)
-        if content_id:
-            record = {
-                'content_id': content_id,
-                'modified': self.get_last_updated(filename, full_path),
-                'path_rel': rel_path or filename,
-            }
-            if full_path:
-                record.update(self._get_file_signature(full_path))
-            if matte_id is not None:
-                record['matte'] = matte_id or 'none'
-            self.uploaded_files[cache_key] = record
+        record = {
+            'content_id': content_id,
+            'modified': self.get_last_updated(filename, full_path),
+            'path_rel': rel_path or filename,
+        }
+        if full_path:
+            record.update(self._get_file_signature(full_path))
+        if matte_id is not None:
+            record['matte'] = matte_id or 'none'
+        self.uploaded_files[cache_key] = record
 
     async def _refresh_uploaded_image_dates(self, content_ids):
         content_ids = set(content_ids)
@@ -1566,6 +1401,7 @@ class monitor_and_display(MQTTIntegrationMixin):
         progress_cb(idx, total, display_name) is called before each upload if provided.
         '''
         upload_delay = self.upload_delay_seconds  # seconds between uploads
+        self._last_upload_attempt_count = len(filenames)
         consecutive_failures = 0
         max_consecutive_failures = 3
         uploaded_count = 0
@@ -1739,12 +1575,9 @@ class monitor_and_display(MQTTIntegrationMixin):
         # Account for images already on the TV (e.g. from failed/partial cleanup).
         # We want the total on-TV count (including what's already there) to stay at
         # or below max_uploads, not just blindly upload max_uploads more on top.
-        # Standby is always present and is not a slideshow slot, so exclude it from the count.
-        standby_basename = os.path.basename(self.standby) if self.standby else None
         already_on_tv = len([
             record for key, record in self.uploaded_files.items()
             if key not in self.exclude
-            and os.path.basename(record.get('path_rel', key)) != standby_basename
         ])
         headroom = max(0, max_uploads - already_on_tv)
         if headroom == 0:
@@ -1917,8 +1750,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 col_rel = [
                     os.path.join(collection, f)
                     for f in raw_files
-                    if f.lower() != 'standby.png'
-                    and os.path.isfile(os.path.join(collection_path, f))
+                    if os.path.isfile(os.path.join(collection_path, f))
                     and os.path.splitext(f)[1].lower() in self._PREVIEW_IMAGE_EXT
                 ]
             except Exception:
@@ -2197,11 +2029,10 @@ class monitor_and_display(MQTTIntegrationMixin):
             self.log.info('skipping art update, as new content_id: %s is the same', content_id)
 
     async def _apply_matte_via_reupload(self, path):
-        '''Make a per-image matte override visible on the TV by deleting the
-        existing content_id and re-uploading the image with the matte baked
-        into the send_image request. This is the only path that actually
-        produces a visible matte change on this firmware (change_matte alone
-        is metadata-only and does not trigger a re-render).
+        '''Make a per-image matte override visible by uploading a replacement,
+        selecting it when necessary, and then deleting the old content ID. This
+        is the only path that actually produces a visible matte change on this
+        firmware (change_matte alone is metadata-only).
 
         Raises:
           - _MatteRejectedError if the TV rejects the matte (-7); the override
@@ -2241,23 +2072,8 @@ class monitor_and_display(MQTTIntegrationMixin):
         file_data, file_type = self.read_file(abs_path)
         if not file_data:
             raise RuntimeError(f'Failed to read file: {abs_path}')
-        # If we're currently showing the image, switch to standby first so
-        # the TV isn't left holding a stale reference during the delete.
         was_current = bool(old_content_id) and old_content_id == self.current_content_id
-        if was_current and self.standby_content_id:
-            try:
-                await self.tv.select_image(self.standby_content_id)
-                self.current_content_id = self.standby_content_id
-            except Exception as ex:
-                self.log.debug('matte apply: pre-delete standby select failed: %s', ex)
-        # Delete the existing content_id
-        if old_content_id:
-            try:
-                self.log.info('matte apply: deleting %s for %s', old_content_id, rel_path)
-                await self.tv.delete_list([old_content_id])
-            except Exception as ex:
-                self.log.warning('matte apply: delete failed for %s (%s): %s', rel_path, old_content_id, ex)
-        # Re-upload with the matte baked in
+        # Upload the replacement before deleting the currently stored version.
         self.log.info('matte apply: re-uploading %s with matte=%s', rel_path, matte)
         rejected = False
         try:
@@ -2295,13 +2111,12 @@ class monitor_and_display(MQTTIntegrationMixin):
             )
             self.write_program_data()
             await self._refresh_uploaded_image_dates([new_content_id])
-            # Restore display if we were showing the image
+            if old_content_id:
+                self._queue_pending_delete_ids([old_content_id])
             if was_current:
-                try:
-                    await self.tv.select_image(new_content_id)
-                    self.current_content_id = new_content_id
-                except Exception as ex:
-                    self.log.debug('matte apply: post-reupload select failed: %s', ex)
+                await self.tv.select_image(new_content_id)
+                self.current_content_id = new_content_id
+            await self._drain_pending_delete_ids()
             try:
                 self._publish_slideshow_state()
             except Exception:
@@ -2317,12 +2132,12 @@ class monitor_and_display(MQTTIntegrationMixin):
         )
         self.write_program_data()
         await self._refresh_uploaded_image_dates([new_content_id])
+        if old_content_id:
+            self._queue_pending_delete_ids([old_content_id])
         if was_current:
-            try:
-                await self.tv.select_image(new_content_id)
-                self.current_content_id = new_content_id
-            except Exception as ex:
-                self.log.warning('matte apply: post-reupload select failed for %s: %s', rel_path, ex)
+            await self.tv.select_image(new_content_id)
+            self.current_content_id = new_content_id
+        await self._drain_pending_delete_ids()
         try:
             self._publish_slideshow_state()
         except Exception:
@@ -2542,14 +2357,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 collection = None
         else:
             # Unknown content (e.g., selected outside uploader); publish sentinel values
-            if not self.current_content_id:
-                display = 'Standby'
-            elif self.standby_content_id and self.current_content_id == self.standby_content_id:
-                # TV is showing standby — report it correctly instead of 'Unknown'
-                display = 'Standby'
-                filename = 'standby.png'
-            else:
-                display = 'Unknown'
+            display = 'Unknown'
         try:
             self._publish_mqtt_discovery()
             self._publish_mqtt_state(display, filename or '', collection)
@@ -2557,7 +2365,7 @@ class monitor_and_display(MQTTIntegrationMixin):
             pass
 
     async def _do_full_reseed(self, req_id=None, skip_started_ack=False):
-        """Standby → delete all TV uploads → upload fresh randomized set → display first.
+        """Delete TV uploads, upload a fresh randomized set, then display the first.
         Shared by the Refresh button, collection selection changes, and Update & Refresh.
         Always publishes MQTT ack progress messages so both UIs show progress for any
         trigger (button press, collection selection change, startup seeding, etc.).
@@ -2577,65 +2385,79 @@ class monitor_and_display(MQTTIntegrationMixin):
                 return
             self._refresh_in_progress = True
         self._publish_slideshow_state()
+        previous_uploads = dict(self.uploaded_files)
+        replacement_selected = False
         try:
             def _on_upload_progress(idx, total, name):
                 ack('progress', f'Uploading {idx}/{total}: {os.path.basename(name)}')
             self._reseed_progress_cb = _on_upload_progress
 
             if skip_started_ack:
-                ack('progress', 'Preparing TV for update — switching to standby...')
+                ack('progress', 'Preparing TV for update...')
             else:
-                ack('started', 'Preparing refresh — switching TV to standby...')
-            await self.ensure_standby_selected()
-            if self.standby_content_id:
-                try:
-                    await self.tv.select_image(self.standby_content_id)
-                    self._publish_mqtt_state('Standby', 'standby.png', None)
-                    self.log.info('Standby selected before cleanup: %s', self.standby_content_id)
-                except Exception as e:
-                    self.log.warning('Failed to select standby before cleanup: %s — invalidating standby_content_id so it will be re-uploaded next run', e)
-                    self.standby_content_id = None
+                ack('started', 'Preparing refresh...')
 
             # Snapshot the current selection so the next pick avoids repeating the same images
             self._last_slideshow_paths = {
                 v.get('path_rel') for v in self.uploaded_files.values() if v.get('path_rel')
             }
 
-            # Count existing uploads before cleanup for the progress message
-            standby_basename = os.path.basename(self.standby) if self.standby else None
-            _existing = len([
-                record for key, record in self.uploaded_files.items()
-                if key not in self.exclude
-                and os.path.basename(record.get('path_rel', key)) != standby_basename
-            ])
-            ack('progress', f'Removing {_existing} old upload(s) from TV...' if _existing else 'Removing old uploads from TV...')
-            if not await self.cleanup_old_uploads():
-                raise RuntimeError('Unable to list or remove existing TV uploads')
-
-            # Re-select standby after cleanup: the TV can revert to the last playing art
-            # (e.g. the previous override image) during the deletion pass, then fall back
-            # to its built-in default when that image is also deleted.  Re-pinning here
-            # ensures we hold standby for the entire upload phase.
-            if self.standby_content_id:
-                try:
-                    await self.tv.select_image(self.standby_content_id)
-                    self.log.info('Standby re-selected after cleanup: %s', self.standby_content_id)
-                except Exception as e:
-                    self.log.warning('Failed to re-select standby after cleanup: %s', e)
-
             ack('progress', 'Uploading new artwork to TV...')
-            await self.sync_file_list()
+            old_content_ids = await self.get_tv_content('MY-C0002')
+            if old_content_ids is None:
+                raise RuntimeError('Unable to list existing TV uploads')
+            self.uploaded_files = {}
+            self._last_upload_attempt_count = 0
             files_added = await self.add_files([])
+            attempted_uploads = getattr(self, '_last_upload_attempt_count', 0)
 
-            if files_added and len(self.get_content_ids()) > 0:
+            if (
+                attempted_uploads > 0
+                and files_added == attempted_uploads
+                and len(self.get_content_ids()) > 0
+            ):
                 self.log.info('Uploads complete, displaying first artwork')
-                await self.change_art()
+                new_content_ids = set(self.get_content_ids())
+                self._queue_pending_delete_ids(old_content_ids)
+                await self._select_replacement(new_content_ids)
+                replacement_selected = True
+                delete_ids = [
+                    content_id
+                    for content_id in old_content_ids
+                    if content_id not in new_content_ids
+                ]
+                if delete_ids:
+                    ack('progress', f'Removing {len(delete_ids)} replaced upload(s) from TV...')
+                await self._drain_pending_delete_ids()
                 self.start = time.time()
                 self.write_program_data()
                 ack('ok', f'Refresh complete — {files_added} photos loaded')
             else:
-                ack('ok', 'Refresh completed')
+                replacement_uploads = dict(self.uploaded_files)
+                previous_by_path = {
+                    record.get('path_rel', key): record.get('content_id')
+                    for key, record in previous_uploads.items()
+                }
+                replaced_old_ids = {
+                    previous_by_path.get(record.get('path_rel', key))
+                    for key, record in replacement_uploads.items()
+                    if record.get('content_id')
+                }
+                self._queue_pending_delete_ids(replaced_old_ids)
+                self.uploaded_files = previous_uploads
+                self.uploaded_files.update(replacement_uploads)
+                self.write_program_data()
+                ack(
+                    'error',
+                    f'Only {files_added} of {attempted_uploads} replacement image(s) uploaded',
+                )
+                return
         except Exception as e:
+            if not replacement_selected:
+                replacement_uploads = dict(self.uploaded_files)
+                self.uploaded_files = previous_uploads
+                self.uploaded_files.update(replacement_uploads)
+                self.write_program_data()
             self.log.warning('Error in full reseed: %s', e)
             ack('error', f'Exception: {e}')
             raise
@@ -2705,8 +2527,7 @@ async def main():
                                         on              = args.on,
                                         token_file      = args.token_file,
                                         exclude         = args.exclude,
-                                        exclude_content_ids = args.exclude_content_ids,
-                                        standby         = args.standby)
+                                        exclude_content_ids = args.exclude_content_ids)
             await mon.start_monitoring()
             break  # Success, exit retry loop
         except Exception as e:

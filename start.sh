@@ -27,8 +27,7 @@ ART_DIR="${SAMSUNG_TV_ART_ART_DIR:-/app/frame_tv_art_collections}"
 UPDATE_MINUTES="${SAMSUNG_TV_ART_UPDATE_MINUTES:-3}"
 CHECK_SECONDS="${SAMSUNG_TV_ART_CHECK_SECONDS:-60}"
 SEQUENTIAL="${SAMSUNG_TV_ART_SEQUENTIAL:-true}"
-STANDBY_FILE="${SAMSUNG_TV_ART_STANDBY_FILE:-/app/frame_tv_art_collections/standby.png}"
-EXCLUDE="${SAMSUNG_TV_ART_EXCLUDE:-$STANDBY_FILE}"
+EXCLUDE="${SAMSUNG_TV_ART_EXCLUDE:-}"
 TOKEN_FILE="${SAMSUNG_TV_ART_TOKEN_FILE:-/data/token_file.txt}"
 
 MEDIA_ROOT="${SAMSUNG_TV_ART_MEDIA_ROOT:-/app/frame_tv_art_collections}"
@@ -40,9 +39,6 @@ if [ "$SEQUENTIAL" = "true" ]; then
 fi
 if [ -n "$EXCLUDE" ]; then
   ARGS="$ARGS -e $EXCLUDE"
-fi
-if [ -n "$STANDBY_FILE" ]; then
-  ARGS="$ARGS --standby $STANDBY_FILE"
 fi
 # Optional: enable verbose debug logging for troubleshooting
 if [ "${SAMSUNG_TV_ART_DEBUG:-false}" = "true" ]; then
@@ -84,32 +80,6 @@ if [ ! -f "$CSV_PATH" ]; then
 fi
 # Export so the Python process inherits the resolved path
 export SAMSUNG_TV_ART_CSV_PATH="$CSV_PATH"
-
-# Ensure standby file exists on mounted media path for UI fallback backgrounds.
-# If missing (or clearly a tiny generated placeholder), restore from bundled default.
-DEFAULT_STANDBY="/app/standby.default.png"
-if [ -n "$STANDBY_FILE" ]; then
-  needs_restore="false"
-  if [ ! -f "$STANDBY_FILE" ]; then
-    needs_restore="true"
-  else
-    # Previous fallback produced a very small black PNG (~8-9KB). Replace it.
-    size_bytes="$(wc -c < "$STANDBY_FILE" 2>/dev/null || echo 0)"
-    case "$size_bytes" in
-      ''|*[!0-9]*) size_bytes=0 ;;
-    esac
-    if [ "$size_bytes" -gt 0 ] && [ "$size_bytes" -le 12000 ]; then
-      needs_restore="true"
-      echo "Standby file at $STANDBY_FILE appears to be a tiny placeholder ($size_bytes bytes); restoring default"
-    fi
-  fi
-
-  if [ "$needs_restore" = "true" ] && [ -f "$DEFAULT_STANDBY" ]; then
-    echo "Restoring standby file at $STANDBY_FILE from bundled default"
-    mkdir -p "$(dirname "$STANDBY_FILE")" 2>/dev/null || true
-    cp -f "$DEFAULT_STANDBY" "$STANDBY_FILE" || echo "Warning: failed to restore standby file"
-  fi
-fi
 
 # Compute a friendly public hostname once — used by both mDNS and the web UI URL.
 # Precedence: explicit env var > container name > sanitized $HOSTNAME

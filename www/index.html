@@ -79,18 +79,17 @@
     .bg { width: 100%; border-radius: 8px; background-color: #0d0c0b; overflow: hidden; border: 1px solid #3a2f2a; }
     #bg { background: transparent; }
     .bg img { width: 100%; height: auto; display: block; border-radius: 8px; }
-    .bg img[src$="/standby.png"] { width: auto; height: 50vh; max-width: 100%; margin: 0 auto; object-fit: contain; }
     #refresh-log { margin-top: 10px; font-size: 0.85em; line-height: 1.6; max-height: 220px; overflow-y: auto; }
     /* Now Playing layout: flex column filling the full tab-content height */
     #viewNowPlaying { flex: 1; min-height: 0; display: flex; flex-direction: column; }
     #viewNowPlaying .bg   { order: 1; flex-shrink: 0; }
     #viewNowPlaying .info-wrap { order: 2; margin-top: 12px; }
     #viewNowPlaying #refresh-log { order: 3; flex-shrink: 0; }
-    /* Standby mode: text above image; info-wrap shrinks, log + bg fill the rest */
-    #viewNowPlaying.standby-mode .info-wrap { order: 1; margin-top: 0; flex: 0 0 auto; }
-    #viewNowPlaying.standby-mode .info { height: auto; color: white; }
-    #viewNowPlaying.standby-mode .bg   { order: 2; margin-top: 10px; flex-shrink: 0; }
-    #viewNowPlaying.standby-mode #refresh-log { order: 3; flex: 1; min-height: 0; max-height: none; overflow-y: auto; margin-top: 6px; }
+    /* Status mode: text first, followed by any operation log. */
+    #viewNowPlaying.status-mode .info-wrap { order: 1; margin-top: 0; flex: 0 0 auto; }
+    #viewNowPlaying.status-mode .info { height: auto; color: white; }
+    #viewNowPlaying.status-mode .bg   { order: 2; margin-top: 10px; flex-shrink: 0; }
+    #viewNowPlaying.status-mode #refresh-log { order: 3; flex: 1; min-height: 0; max-height: none; overflow-y: auto; margin-top: 6px; }
     /* Info section: .info-wrap is the flex child that takes remaining space; .info scrolls */
     .info-wrap { flex: 1; min-height: 0; }
     .info { height: 100%; overflow-y: auto; }
@@ -829,9 +828,8 @@
           if (topic === `${TOPIC_CMD_PREFIX}/collections/refresh`) {
             if (!refreshInProgress) {
               refreshInProgress = true;
-              refreshLog = ['Refresh request received — switching TV to standby...'];
-              const standbyUrl = `${location.origin}/app/frame_tv_art_collections/standby.png`;
-              $bg.innerHTML = `<img src="${standbyUrl}" alt="standby">`;
+              refreshLog = ['Refresh request received...'];
+              $bg.innerHTML = '';
               if ($refresh) { $refresh.disabled = true; $refresh.classList.add('spinning'); $refresh.style.opacity = '0.7'; }
               renderRefreshLog();
             }
@@ -842,8 +840,8 @@
             if (line) {
               logLines.push(line);
               if (logLines.length > LOG_MAX_LINES) logLines.shift();
-              // Show live in #refresh-log only when in standby and not in a curated refresh
-              if (!refreshInProgress && slideshowStandby) renderLiveLog();
+              // Show live status while artwork is unavailable and no curated refresh owns the log.
+              if (!refreshInProgress && slideshowUnavailable) renderLiveLog();
             }
             return;
           }
@@ -986,8 +984,7 @@
                     refreshInProgress = true;
                     if ($refresh) { $refresh.disabled = true; $refresh.classList.add('spinning'); $refresh.style.opacity = '0.7'; }
                     refreshLog = [];
-                    const standbyUrl = `${location.origin}/app/frame_tv_art_collections/standby.png`;
-                    $bg.innerHTML = `<img src="${standbyUrl}" alt="standby">`;
+                    $bg.innerHTML = '';
                   }
                   refreshLog.push(msg || 'Refresh in progress...');
                   renderRefreshLog();
@@ -1417,9 +1414,9 @@
     function renderRefreshLog() {
       // Cancel the stale-state safety timer — a real ack just arrived
       if (_refreshSafetyTimer) { clearTimeout(_refreshSafetyTimer); _refreshSafetyTimer = null; }
-      // Standby mode: text above image
+      // Status mode: text above the operation log.
       const $np = document.getElementById('viewNowPlaying');
-      if ($np) $np.classList.add('standby-mode');
+      if ($np) $np.classList.add('status-mode');
       const $log = document.getElementById('refresh-log');
       $info.innerHTML = '<div style="color:white">Refresh in progress\u2026</div>';
       if ($log) { $log.innerHTML = refreshLog.map(logLineHtml).join(''); requestAnimationFrame(() => { $log.scrollTop = $log.scrollHeight; }); }
@@ -1434,7 +1431,7 @@
         if (_age < 2 * 60 * 1000) {
           refreshLog = _entry.log || [];
           refreshInProgress = true;
-          if ($bg) $bg.innerHTML = `<img src="${location.origin}/app/frame_tv_art_collections/standby.png" alt="standby">`;
+          if ($bg) $bg.innerHTML = '';
           renderRefreshLog();
           // Safety valve: if no new refresh ack arrives within 8s the sync is
           // already done — clear the stale state so the UI recovers automatically.
@@ -1487,36 +1484,36 @@
       const isPowerOff = attrs.tv_power_on === false;
       const isUnknownStatus = !isPowerOff && attrs.art_mode_state === 'unknown';
       const isNotInArtMode = !isPowerOff && !isUnknownStatus && attrs.in_art_mode === false;
-      const isStandbyLike = isPowerOff || isUnknownStatus || isNotInArtMode || !normalizedFile || normalizedFile === 'standby.png' || normalizedFile === 'unknown' || normalizedFile === 'unavailable' || normalizedFile === 'none' || normalizedFile === 'power_off';
-      const isStandby = normalizedFile === 'standby.png';
-      slideshowStandby = isStandbyLike;
+      const isUnavailable = isPowerOff || isUnknownStatus || isNotInArtMode || !normalizedFile || normalizedFile === 'unknown' || normalizedFile === 'unavailable' || normalizedFile === 'none' || normalizedFile === 'power_off';
+      slideshowUnavailable = isUnavailable;
       updateSlideshowActionLocks();
       if (_updateSettingsBtnState) _updateSettingsBtnState(isPowerOff || isUnknownStatus || isNotInArtMode, isPowerOff || isUnknownStatus || isNotInArtMode);
 
       let t = '';
       if (isPowerOff) {
-        if ($np) $np.classList.add('standby-mode');
+        if ($np) $np.classList.add('status-mode');
         $bg.style.background = '#271515';
         $bg.innerHTML = '';
         t = 'TV Power Off';
       } else if (isUnknownStatus) {
-        if ($np) $np.classList.add('standby-mode');
+        if ($np) $np.classList.add('status-mode');
         $bg.style.background = '#252525';
         $bg.innerHTML = '';
         t = 'Unknown status';
       } else if (isNotInArtMode) {
-        if ($np) $np.classList.add('standby-mode');
+        if ($np) $np.classList.add('status-mode');
         $bg.style.background = '#3b2012';
         $bg.innerHTML = '';
         t = 'TV is not in art mode';
-      } else if (isStandbyLike) {
+      } else if (isUnavailable) {
         $bg.style.background = '';
-        if ($np) $np.classList.add('standby-mode');
-        t = 'Please stand by as artwork is loaded...';
+        $bg.innerHTML = '';
+        if ($np) $np.classList.add('status-mode');
+        t = 'Artwork is unavailable';
         renderLiveLog();
       } else {
         $bg.style.background = '';
-        if ($np) $np.classList.remove('standby-mode');
+        if ($np) $np.classList.remove('status-mode');
         const $logEl = document.getElementById('refresh-log');
         if ($logEl) $logEl.innerHTML = '';
         const _fb = (!title && !artist) ? parseArtworkInfo(file) : null;
@@ -1539,27 +1536,23 @@
       const gen = setInfo._gen;
 
       // Build image URL using this host's static server (provided by uploader)
-      if (file && !isStandby && !isNotInArtMode) {
+      if (file && !isUnavailable) {
         // Prefer explicit artwork_dir from CSV, then collection, then artist_name, then filename heuristic
         const folder = attrs.artwork_dir || attrs.collection || artist || (file.match(/^(.+?)_[^_]+_/)?.[1] || '');
         const url = `${location.origin}/app/frame_tv_art_collections/${encodeURIComponent(folder)}/${encodeURIComponent(file)}`;
-        // Preload to ensure show/hide behavior for standby vs artwork
+        // Preload so a failed artwork request does not replace the current UI.
         const img = new Image();
         img.onload = () => { if (setInfo._gen === gen) $bg.innerHTML = `<img src="${url}" alt="artwork">`; };
         img.onerror = () => {
           if (setInfo._gen !== gen) return;
-          // Fallback to immutable baked standby image if artwork load fails
-          const standbyUrl = `${location.origin}/app/frame_tv_art_collections/standby.png`;
-          $bg.innerHTML = `<img src="${standbyUrl}" alt="standby">`;
+          $bg.innerHTML = '';
           // Clear cache key so next MQTT message retries the artwork image
           // (e.g. after a container restart briefly causes a 404)
           setInfo._lastKey = null;
         };
         img.src = url;
       } else if (!isNotInArtMode) {
-        // No file or standby — show immutable baked standby explicitly
-        const standbyUrl = `${location.origin}/app/frame_tv_art_collections/standby.png`;
-        $bg.innerHTML = `<img src="${standbyUrl}" alt="standby">`;
+        $bg.innerHTML = '';
       }
     }
 
@@ -1816,10 +1809,9 @@
       const reqId = Date.now();
       if (_refreshSafetyTimer) { clearTimeout(_refreshSafetyTimer); _refreshSafetyTimer = null; }
       refreshInProgress = true;
-      refreshLog = ['Please stand by as artwork is loaded...', 'Fetching latest collection updates...'];
+      refreshLog = ['Fetching latest collection updates...'];
       renderRefreshLog();
-      const standbyUrl = `${location.origin}/app/frame_tv_art_collections/standby.png`;
-      $bg.innerHTML = `<img src="${standbyUrl}" alt="standby">`;
+      $bg.innerHTML = '';
       $syncCollections.textContent = 'Updating\u2026';
       $syncCollections.disabled = true;
       client.publish(`${TOPIC_CMD_PREFIX}/settings/sync_collections`, JSON.stringify({ req_id: reqId }), { qos: 1, retain: false });
@@ -2827,7 +2819,7 @@
 
     let slideshowUploading = false;
     let slideshowMode = 'auto';
-    let slideshowStandby = false;
+    let slideshowUnavailable = false;
     let slideshowReverting = false;
     let slideshowPostClear = false;              // blocks size===0 reseed from stale current_paths after clear
     let slideshowClearRefreshPending = false;    // set when Clear fires collections/refresh

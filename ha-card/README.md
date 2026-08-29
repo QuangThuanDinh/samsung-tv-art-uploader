@@ -43,7 +43,6 @@ A viewer-only [Home Assistant](https://www.home-assistant.io/) Lovelace card for
 
   ![Card in not-in-art-mode state](images/hacard_art_mode_off_v0.2.1.png)
 - **Fixed / dynamic layout** — `fixed` mode (default) constrains the card to a 16:9 aspect ratio matching the TV; when artwork metadata overflows the info area a soft fade indicates more content, and tapping the info panel opens a floating detail overlay without growing the card. `dynamic` mode retains the behaviour where the card grows with content (see [Layout mode](#layout-mode) below)
-- **Standby progress log** — while the TV is reseeding, live status messages from the backend (`frame_tv/log` MQTT topic) are shown below the standby image so you can see what's happening. Note: this uses Home Assistant's `mqtt/subscribe` WebSocket command, so log streaming is available to admin users; non-admin users still see card state but not the live log lines.
 - **Mixed-content safe** — resolves image paths over HTTP or HTTPS to match the HA frontend protocol
 
 > **Why viewer-only?** The card used to host the full collection selector, refresh actions, slideshow editor, matte pickers, presets, and settings inline. As those features grew, the in-card UX hit hard ceilings inside the Lovelace context. v0.4.0 ships the card as a pure viewer and points the cog at the real web UI where the full editor lives.
@@ -72,7 +71,7 @@ A viewer-only [Home Assistant](https://www.home-assistant.io/) Lovelace card for
    ```yaml
    lovelace:
      resources:
-         url: /local/samsung-tv-art-card/samsung-tv-art-card.js?v=v0.4.1
+         url: /local/samsung-tv-art-card/samsung-tv-art-card.js?v=v0.4.2
          type: module
    ```
 
@@ -106,8 +105,6 @@ web_ui_url: http://samsung-tv-art.local:8080
 # Override only if your sensor name differs from the default
 selected_artwork_file_entity: sensor.frame_tv_art_selected_artwork
 
-# Optional — explicit standby image override (otherwise <image_path>/standby.png)
-standby_image_path: /local/images/frame_tv_art_collections/standby.png
 ```
 
 ### Optional: add the web UI as a sidebar item
@@ -162,4 +159,4 @@ layout_mode: dynamic
 
 ## Version
 
-Current version: **v0.4.1** — bump the `?v=` cache-buster in the resource URL whenever you upgrade.
+Current version: **v0.4.2** — bump the `?v=` cache-buster in the resource URL whenever you upgrade.

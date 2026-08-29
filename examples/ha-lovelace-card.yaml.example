@@ -34,9 +34,6 @@ image_path_http: http://10.0.0.10:8080/app/frame_tv_art_collections
 # Option C: via HA /local (copy media into HA www — always works, no mixed content)
 # image_path: /local/frame_tv_art_collections
 
-# Optional: explicit standby image path (defaults to <image_path>/standby.png)
-# standby_image_path: /local/frame_tv_art_collections/standby.png
-
 # Optional: card display title
 title: Frame TV Art
 icon: mdi:palette

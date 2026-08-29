@@ -21,7 +21,6 @@ Built on top of [NickWaterton/samsung-tv-ws-api](https://github.com/NickWaterton
 - Publishes artwork metadata (title, artist, description, collection) to MQTT for Home Assistant
 - MQTT discovery — entities are auto-created in HA with no manual YAML
 - Built-in web UI (port 8080) for collection selection, settings, and manual refresh
-- Optional dynamic standby artwork generated from the first explicitly selected image, or the first image in the first selected collection, with the bundled image retained as a fallback
 - Offline selection queue — slideshow changes are persisted while the TV is unavailable and applied automatically when it returns to Art Mode
 - **Saved Selections** — name and save any image set as a preset; synced across all clients via retained MQTT; auto-generates thematic defaults (Landscapes, Marine, Impressionism, etc.) on first start
 - **Per-collection carousels** with S/M/L thumbnail size controls and a shuffle preview mode
@@ -192,7 +191,7 @@ your-collection-repo/
 
 The easiest way to manage collections is via the **Settings → Collections** tab in the web UI. All 54 available artist collections from [github.com/kohlerryan](https://github.com/kohlerryan?tab=repositories) are listed as checkboxes. **Save List** only saves the repository list. **Pull List** saves and downloads that list, then rebuilds local artwork metadata without contacting the TV. **Update & Refresh** downloads the list and also reseeds the TV.
 
-Slideshow **Apply** preserves matching cached TV uploads and only removes or uploads images that changed, including matte changes. **ReUpload All Images** explicitly removes all user-uploaded images except the standby image and uploads the complete selected set again.
+Slideshow **Apply** preserves matching cached TV uploads and only replaces images that changed, including matte changes. **ReUpload All Images** uploads the complete replacement set, switches the TV to a new image, and then removes the old uploads.
 
 Custom or third-party repository URLs can be pasted into the **Custom Repositories** text area below the checkbox grid, one URL per line.
 
@@ -433,11 +432,9 @@ samsung-tv-art/
 │   ├── tv_connection.py   — TV WebSocket lifecycle and Art Mode queries
 │   ├── mqtt_integration.py — MQTT, settings, collections, and slideshow integration
 │   ├── pil_methods.py     — Pillow-based image synchronization
-│   ├── standy_util.py     — dynamic standby image helper
 │   ├── aggregate_csv.py   — collection metadata aggregation
 │   └── serve.py           — minimal HTTP server for the web UI
 ├── assets/
-│   ├── standby.png                                      — default standby artwork baked into the image
 │   ├── hacard_fixed_v0.2.1.png                          — HA card fixed layout screenshot
 │   ├── hacard_art_mode_off_v0.2.1.png                   — HA card not-in-art-mode state
 │   ├── hacard_collection_selection_v0.2.1.png           — HA card collection selector
