@@ -4,6 +4,7 @@ import os
 import socket
 
 from samsungtvws.async_art import SamsungTVAsyncArt
+from samsungtvws.async_connection import SamsungTVWSAsyncConnection
 
 
 _REDACTED = '[REDACTED]'
@@ -46,6 +47,14 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
         self._max_response_chars = max_response_chars
         self._retired = False
         super().__init__(*args, **kwargs)
+
+    async def open(self):
+        if self._retired:
+            raise ConnectionError('retired TV WebSocket cannot be reopened')
+        # SamsungTVAsyncArt.open() waits indefinitely for ms.channel.ready.
+        # Some Frame firmware accepts the channel but never emits that optional
+        # event, so use the base handshake and let the listener process it if sent.
+        return await SamsungTVWSAsyncConnection.open(self)
 
     async def start_listening(self, *args, **kwargs):
         if self._retired:

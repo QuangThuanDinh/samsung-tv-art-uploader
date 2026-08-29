@@ -538,7 +538,11 @@ class monitor_and_display(MQTTIntegrationMixin):
                 self.log.info('Connected to TV with a fresh WebSocket client')
                 return True
         except Exception as e:
-            self.log.debug('Fresh TV connection failed: %s', e)
+            self.log.debug(
+                'Fresh TV connection failed (%s): %s',
+                type(e).__name__,
+                e,
+            )
         if self.tv is not None:
             self.tv.retire()
         return False
