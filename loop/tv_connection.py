@@ -56,6 +56,8 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
         self._heartbeat_task = None
         self._suppress_disconnect_log = False
         self._active_listener = None
+        self._disconnect_callback = None
+        self._token_logged = False
         self._ready_timeout = self._read_positive_seconds(
             'SAMSUNG_TV_ART_READY_TIMEOUT_SECONDS',
             10,
@@ -74,16 +76,22 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
             return float(default)
 
     def get_token(self):
+        # Logged once per client so repeated reconnect attempts do not bury the
+        # actual connection failure under identical endpoint lines.
+        should_log = not getattr(self, '_token_logged', False)
+        self._token_logged = True
         if self.port == 8001:
+            if should_log:
+                self._response_logger.info(
+                    'Art WebSocket uses ws://%s:8001; token pairing is skipped',
+                    self.host,
+                )
+            return None
+        if should_log:
             self._response_logger.info(
-                'Art WebSocket uses ws://%s:8001; token pairing is skipped',
+                'Art WebSocket uses wss://%s:8002; token authentication is enabled',
                 self.host,
             )
-            return None
-        self._response_logger.info(
-            'Art WebSocket uses wss://%s:8002; token authentication is enabled',
-            self.host,
-        )
         return super().get_token()
 
     async def open(self):
@@ -205,6 +213,38 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
         self._channel_id = None
         self._channel_ready.clear()
         self._active_listener = None
+        self._notify_disconnect()
+
+    def _notify_disconnect(self):
+        if self._disconnect_callback is None:
+            return
+        try:
+            self._disconnect_callback()
+        except Exception as exc:
+            self._response_logger.warning(
+                'TV Art WebSocket disconnect callback failed: %s',
+                exc,
+            )
+
+    @property
+    def socket_state(self):
+        """WebSocket transport state, the Python analogue of readyState."""
+        connection = getattr(self, 'connection', None)
+        if connection is None:
+            return 'no-socket'
+        state = getattr(connection, 'state', None)
+        if state is not None:
+            return getattr(state, 'name', str(state))
+        if getattr(connection, 'open', False):
+            return 'OPEN'
+        if getattr(connection, 'closed', False):
+            return 'CLOSED'
+        return 'unknown'
+
+    @property
+    def channel_ready(self):
+        """True once ms.channel.ready has been observed for the live socket."""
+        return self._channel_ready.is_set()
 
     async def close(self):
         self._suppress_disconnect_log = True
@@ -248,6 +288,7 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
                 type(exc).__name__,
                 exc,
             )
+            self._notify_disconnect()
             await self.close()
         finally:
             if self._heartbeat_task is asyncio.current_task():
@@ -375,6 +416,7 @@ class FrameTVConnection:
         self._reconnect_delay = reconnect_delay
         self._power_state_callback = power_state_callback
         self._retired = False
+        self._client._disconnect_callback = self._handle_art_disconnect
         self._register_artmode_callbacks()
 
     def __getattr__(self, name):
@@ -383,6 +425,13 @@ class FrameTVConnection:
     def _signal_artmode_change(self):
         if self._artmode_event:
             self._artmode_event.set()
+
+    def _handle_art_disconnect(self):
+        if self._retired:
+            return
+        self._retired = True
+        self._client._retired = True
+        self._signal_artmode_change()
 
     def _notify_power_state(self, state):
         if self._power_state_callback:
@@ -464,7 +513,10 @@ class FrameTVConnection:
         last_error = None
         for attempt in range(2):
             try:
-                return str(await self._client.get_artmode()).lower() == 'on'
+                status = await self._client.get_artmode()
+                if status is None:
+                    raise TimeoutError('empty Art Mode response')
+                return str(status).lower() == 'on'
             except Exception as exc:
                 last_error = exc
                 self._logger.debug(
@@ -472,4 +524,5 @@ class FrameTVConnection:
                     attempt + 1,
                     exc,
                 )
+        self.retire()
         raise last_error if last_error else AssertionError('artmode query failed')

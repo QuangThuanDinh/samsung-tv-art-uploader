@@ -141,6 +141,28 @@ class monitor_and_display(MQTTIntegrationMixin):
         self.selection_only = os.environ.get('SAMSUNG_TV_ART_SELECTION_ONLY', '').lower() in ['1', 'true', 'yes']
         self.consecutive_failures = 0
         self.reconnect_delay = 5
+        # Art WebSocket handshake failures get their own escalating cooldown so a
+        # wedged art-app channel is not hammered every few seconds. Rapid retries
+        # leave half-open sessions on the TV and can keep the channel wedged.
+        self._connect_failures = 0
+        self._next_connect_attempt = 0.0
+        self._first_connect_failure_time = None
+        self.connect_retry_max_seconds = max(
+            5,
+            int(os.environ.get('SAMSUNG_TV_ART_CONNECT_RETRY_MAX_SECONDS', '60')),
+        )
+        # Last-resort self-heal: if the TV answers REST but no Art handshake has
+        # succeeded for this long, exit so the container restart policy supplies
+        # a clean process. Set to 0 to disable.
+        self.connect_watchdog_seconds = max(
+            0,
+            int(os.environ.get('SAMSUNG_TV_ART_CONNECT_WATCHDOG_SECONDS', '1800')),
+        )
+        self.art_status_probe_seconds = max(
+            5,
+            int(os.environ.get('SAMSUNG_TV_ART_STATUS_PROBE_SECONDS', '15')),
+        )
+        self._last_art_status_probe = 0
         self.update_time = int(max(0, update_time*60))   #convert minutes to seconds
         self.period = min(max(5, period), self.update_time) if self.update_time > 0 else period
         self.include_fav = include_fav
@@ -500,9 +522,101 @@ class monitor_and_display(MQTTIntegrationMixin):
                     return False
                 await asyncio.sleep(1)
 
+    def _note_connect_success(self):
+        """Clear handshake backoff after a working Art WebSocket is established."""
+        if self._connect_failures:
+            self.log.info(
+                'Art WebSocket recovered after %d failed attempt(s)',
+                self._connect_failures,
+            )
+        self._connect_failures = 0
+        self._next_connect_attempt = 0.0
+        self._first_connect_failure_time = None
+
+    def _reset_connect_backoff(self):
+        """Allow an immediate retry, e.g. once the TV power-cycles."""
+        self._connect_failures = 0
+        self._next_connect_attempt = 0.0
+        self._first_connect_failure_time = None
+
+    def _note_connect_failure(self, reason):
+        """Record a handshake failure, log the real cause, and back off."""
+        now = time.time()
+        self._connect_failures += 1
+        if self._first_connect_failure_time is None:
+            self._first_connect_failure_time = now
+        delay = min(
+            self.reconnect_delay * (2 ** (self._connect_failures - 1)),
+            self.connect_retry_max_seconds,
+        )
+        self._next_connect_attempt = now + delay
+        # The first few failures and every tenth afterwards are visible, so the
+        # underlying cause is never silently swallowed the way it used to be.
+        log_fn = (
+            self.log.warning
+            if self._connect_failures <= 3 or self._connect_failures % 10 == 0
+            else self.log.debug
+        )
+        log_fn(
+            'Fresh TV connection failed (attempt %d, next retry in %ss): %s',
+            self._connect_failures,
+            int(delay),
+            reason,
+        )
+        self._check_connect_watchdog(now)
+
+    def _check_connect_watchdog(self, now):
+        """Exit when the Art channel stays unusable while the TV answers REST."""
+        if self.connect_watchdog_seconds <= 0:
+            return
+        if self._first_connect_failure_time is None:
+            return
+        stuck_seconds = now - self._first_connect_failure_time
+        if stuck_seconds < self.connect_watchdog_seconds:
+            return
+        self.log.error(
+            'No Art WebSocket handshake succeeded for %d minute(s) across %d '
+            'attempts while the TV answered REST; exiting so the container '
+            'restarts with a clean process',
+            int(stuck_seconds // 60),
+            self._connect_failures,
+        )
+        try:
+            logging.shutdown()
+        finally:
+            os._exit(1)
+
+    def _describe_socket_state(self):
+        """Report the Art WebSocket transport state for diagnostic logging."""
+        tv = self.tv
+        if tv is None:
+            return 'no-connection'
+        try:
+            if tv.retired:
+                return '{} (retired)'.format(tv.socket_state)
+            return tv.socket_state
+        except Exception:
+            return 'unavailable'
+
+    def _log_art_liveness_probe(self):
+        """Announce the periodic real Art request used to prove liveness."""
+        tv = self.tv
+        try:
+            channel_ready = bool(tv.channel_ready) if tv is not None else False
+        except Exception:
+            channel_ready = False
+        self.log.info(
+            'Art liveness probe: sending get_artmode_status (socket=%s, '
+            'channel_ready=%s)',
+            self._describe_socket_state(),
+            channel_ready,
+        )
+
     async def reconnect_tv(self, power_verified=False):
         """Replace a dropped Art client; never reopen the old WebSocket object."""
         self._status_check_needed = True
+        if time.time() < self._next_connect_attempt:
+            return False
         old_tv = self.tv
         if old_tv is not None:
             old_tv.retire()
@@ -514,18 +628,19 @@ class monitor_and_display(MQTTIntegrationMixin):
         try:
             self._create_tv_connection()
             if not power_verified and not await self.tv.is_powered_on():
+                # A powered-off TV is not a handshake failure; keep recovery
+                # instant for when it wakes back up.
+                self._reset_connect_backoff()
                 self.tv.retire()
                 return False
             await asyncio.wait_for(self.tv.start_listening(), timeout=15)
             if self.tv.is_alive():
+                self._note_connect_success()
                 self.log.info('Connected to TV with a fresh WebSocket client')
                 return True
+            self._note_connect_failure('WebSocket closed immediately after start')
         except Exception as e:
-            self.log.debug(
-                'Fresh TV connection failed (%s): %s',
-                type(e).__name__,
-                e,
-            )
+            self._note_connect_failure('{}: {}'.format(type(e).__name__, e))
         if self.tv is not None:
             self.tv.retire()
         return False
@@ -554,6 +669,9 @@ class monitor_and_display(MQTTIntegrationMixin):
             if not powered_on:
                 self._tv_off_confirmed = True
                 self.tv.retire()
+                # The TV being off is not an Art handshake failure. Clearing the
+                # backoff keeps wake-up recovery immediate.
+                self._reset_connect_backoff()
                 prev = self._in_art_mode
                 power_was_on = self._tv_powered_on is not False
                 self._tv_powered_on = False
@@ -2216,12 +2334,30 @@ class monitor_and_display(MQTTIntegrationMixin):
             await self.bing_daily.tick()
 
             # Poll Art Mode only when its state is unknown, after a TV event, or
-            # while REST reports that the TV is powered off. Valid on/off Art
-            # responses remain authoritative until an event or a major action
-            # requests a fresh check.
-            if self._status_check_needed or self._tv_powered_on is False:
+            # while REST reports that the TV is powered off. A periodic
+            # application-level probe also catches sockets whose ping/pong
+            # transport is alive but whose Art service no longer responds.
+            status_probe_due = (
+                self._in_art_mode is True
+                and time.time() - self._last_art_status_probe
+                >= self.art_status_probe_seconds
+            )
+            if (
+                self._status_check_needed
+                or self._tv_powered_on is False
+                or status_probe_due
+            ):
                 self._artmode_event.clear()
+                if status_probe_due:
+                    self._log_art_liveness_probe()
                 in_artmode = await self.safe_in_artmode()
+                if status_probe_due:
+                    self.log.info(
+                        'Art liveness probe answered: art_mode=%s (socket=%s)',
+                        in_artmode,
+                        self._describe_socket_state(),
+                    )
+                self._last_art_status_probe = time.time()
             else:
                 in_artmode = self._in_art_mode is True
 
