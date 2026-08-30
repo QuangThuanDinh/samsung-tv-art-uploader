@@ -368,14 +368,19 @@ class TestModeParsingTests(unittest.TestCase):
     def test_supported_modes_round_trip(self):
         self.assertEqual(self.read('0'), TEST_MODE_NORMAL)
         self.assertEqual(self.read('1'), TEST_MODE_IGNORE_READY)
-        self.assertEqual(self.read('3'), TEST_MODE_HANG_ON_READY)
+        self.assertEqual(self.read('2'), TEST_MODE_HANG_ON_READY)
+
+    def test_legacy_hang_value_still_maps_to_hang_mode(self):
+        logger = mock.Mock()
+        self.assertEqual(self.read('3', logger), TEST_MODE_HANG_ON_READY)
+        logger.warning.assert_called_once()
 
     def test_surrounding_whitespace_is_tolerated(self):
         self.assertEqual(self.read('  1  '), TEST_MODE_IGNORE_READY)
 
     def test_unknown_mode_falls_back_and_warns(self):
         logger = mock.Mock()
-        self.assertEqual(self.read('2', logger), TEST_MODE_NORMAL)
+        self.assertEqual(self.read('7', logger), TEST_MODE_NORMAL)
         logger.warning.assert_called_once()
 
     def test_non_numeric_falls_back_and_warns(self):

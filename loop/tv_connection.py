@@ -43,13 +43,17 @@ def _sanitize_websocket_payload(value):
 # ready. These modes make that behaviour comparable at runtime.
 TEST_MODE_NORMAL = 0          # Time out, tear the socket down, retry with backoff.
 TEST_MODE_IGNORE_READY = 1    # Time out, then carry on as if the channel were ready.
-TEST_MODE_HANG_ON_READY = 3   # Wait forever, reproducing homebridge-samsung-tizen.
+TEST_MODE_HANG_ON_READY = 2   # Wait forever, reproducing homebridge-samsung-tizen.
 
 _TEST_MODES = (
     TEST_MODE_NORMAL,
     TEST_MODE_IGNORE_READY,
     TEST_MODE_HANG_ON_READY,
 )
+
+# 3 was the value first published for the hang mode; keep it working so an
+# existing configuration does not silently fall back to normal behaviour.
+_TEST_MODE_ALIASES = {3: TEST_MODE_HANG_ON_READY}
 
 TEST_MODE_ENV_VAR = 'SAMSUNG_TV_ART_TEST_MODE'
 
@@ -67,6 +71,16 @@ def read_test_mode(logger=None):
         mode = int(raw)
     except ValueError:
         mode = None
+    if mode in _TEST_MODE_ALIASES:
+        mode = _TEST_MODE_ALIASES[mode]
+        if logger is not None:
+            logger.warning(
+                '%s=%s is deprecated; use %d instead (%s).',
+                TEST_MODE_ENV_VAR,
+                raw,
+                mode,
+                _TEST_MODE_DESCRIPTIONS[mode],
+            )
     if mode not in _TEST_MODES:
         if logger is not None:
             logger.warning(

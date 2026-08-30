@@ -197,6 +197,9 @@ class monitor_and_display(MQTTIntegrationMixin):
         self.fav = set()
         self.api_version = 0
         self.api_version_str = None        # Raw string from get_api_version(), e.g. '0.97' or '4.3.4.0'
+        # Set when the TV-dependent half of initialize() could not run because the
+        # Art channel was unavailable, so the main loop can retry it later.
+        self._tv_init_pending = False
         self.api_version_failed = False    # True when api_version request itself errors (e.g. error -9)
         self._ws_binary_latched = False    # True once a WS-binary upload has succeeded via -1 fallback
         self._upload_compat_warned = False  # Emit old-API diagnostic at most once
@@ -1185,6 +1188,63 @@ class monitor_and_display(MQTTIntegrationMixin):
                 self.log.warning('Error getting mattes list, setting to none')
             self.matte = 'none'
             
+    def _art_channel_is_live(self):
+        """True when the Art channel finished its handshake and is still usable."""
+        tv = self.tv
+        if tv is None or tv.retired:
+            return False
+        try:
+            return bool(tv.is_alive() and tv.channel_ready)
+        except Exception:
+            return False
+
+    async def _initialize_tv_state(self):
+        """Run the TV-dependent half of initialization, deferring if needed.
+
+        Startup frequently happens while the TV is on HDMI, where the art-app
+        channel never completes its handshake. This used to run once against a
+        dead channel, report the TV as empty, and never retry for the life of
+        the process, leaving uploaded_files unreconciled all session.
+        """
+        if not self._art_channel_is_live():
+            if not self._tv_init_pending:
+                self.log.info(
+                    'Art channel is not available yet; deferring TV-dependent '
+                    'initialization until the handshake succeeds'
+                )
+            self._tv_init_pending = True
+            return
+        await self.get_api_version()
+        if self._in_art_mode is True:
+            await self._drain_pending_delete_ids()
+        if not self.sync:
+            self.log.warning('syncing disabled, not updating uploaded files list')
+            self._tv_init_pending = False
+            return
+        if self.api_version_str in self._WS_BINARY_API_VERSIONS:
+            # Legacy Frame TVs (Art API 0.97/1.07) return thumbnails as a single
+            # unframed binary WebSocket packet on the main connection. The library's
+            # listen loop tries to JSON-decode it, throws, and leaves the async
+            # request/response dispatcher desynchronized — after which every request
+            # (get_artmode, etc.) times out and rotation stalls. Skip thumbnail sync
+            # entirely on these models; content IDs are tracked via the persistent
+            # cache, so the PIL reconciliation isn't needed.
+            self.log.info(
+                'Skipping PIL thumbnail sync on legacy Art API %s — this firmware returns '
+                'thumbnails as an unframed binary WS packet that desyncs the async dispatcher; '
+                'content IDs are tracked via the persistent cache instead.',
+                self.api_version_str,
+            )
+            self._tv_init_pending = False
+            return
+        completed = await self.pil.initialize()
+        self._tv_init_pending = not completed
+        if not completed:
+            self.log.info(
+                'TV-dependent initialization is incomplete; it will retry once '
+                'the Art channel recovers'
+            )
+
     async def initialize(self):
         '''
         initializes program
@@ -1245,28 +1305,8 @@ class monitor_and_display(MQTTIntegrationMixin):
             # Non-fatal; continue with no selection
             pass
         self.load_program_data()
-        if self._in_art_mode is True:
-            await self._drain_pending_delete_ids()
         self.log.info('files in directory: {}: {}'.format(self.folder, self.get_folder_files()))
-        if self.sync:
-            if self.api_version_str in self._WS_BINARY_API_VERSIONS:
-                # Legacy Frame TVs (Art API 0.97/1.07) return thumbnails as a single
-                # unframed binary WebSocket packet on the main connection. The library's
-                # listen loop tries to JSON-decode it, throws, and leaves the async
-                # request/response dispatcher desynchronized — after which every request
-                # (get_artmode, etc.) times out and rotation stalls. Skip thumbnail sync
-                # entirely on these models; content IDs are tracked via the persistent
-                # cache, so the PIL reconciliation isn't needed.
-                self.log.info(
-                    'Skipping PIL thumbnail sync on legacy Art API %s — this firmware returns '
-                    'thumbnails as an unframed binary WS packet that desyncs the async dispatcher; '
-                    'content IDs are tracked via the persistent cache instead.',
-                    self.api_version_str,
-                )
-            else:
-                await self.pil.initialize() #optional
-        else:
-            self.log.warning('syncing disabled, not updating uploaded files list')
+        await self._initialize_tv_state()
         
         # Display art immediately after init only if TV is already in art mode.
         # If not, the main loop will pick it up when art mode is detected naturally.
@@ -2434,6 +2474,11 @@ class monitor_and_display(MQTTIntegrationMixin):
                 continue
 
             await self.bing_daily.tick()
+
+            # Startup may have happened while the Art channel was unreachable, so
+            # finish the TV-dependent initialization as soon as one is live.
+            if self._tv_init_pending and self._art_channel_is_live():
+                await self._initialize_tv_state()
 
             # The liveness probe now runs on its own task so its interval is
             # independent of this loop's period and of the current art mode.

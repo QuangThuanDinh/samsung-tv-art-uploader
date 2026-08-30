@@ -33,18 +33,26 @@ class PIL_methods:
         if it doesn't already exist
         '''
         if not HAVE_PIL:
-            return
+            return True
         self.log.info('Checking uploaded files list using PIL')
         files_images = self.load_files()
         if files_images:
             self.log.info('getting My Photos list')
             my_photos = await self.mon.get_tv_content('MY-C0002')
-            if my_photos is not None and len(my_photos) > 0:
+            if my_photos is None:
+                # None means the request failed. Reporting that as "no photos"
+                # states a fact we never established and hides a dead channel.
+                self.log.warning(
+                    'could not read My Photos from TV; skipping thumbnail sync'
+                )
+                return False
+            if my_photos:
                 await self.check_thumbnails(files_images, my_photos)
             else:
                 self.log.info('no photos found on tv')
         else:
             self.log.info('no files, using origional uploaded files list')
+        return True
             
     async def check_thumbnails(self, files_images, my_photos):
         '''
