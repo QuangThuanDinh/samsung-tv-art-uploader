@@ -1,8 +1,16 @@
 import asyncio
+import os
 import time
 import unittest
 from unittest import mock
 
+from loop.tv_connection import (
+    TEST_MODE_HANG_ON_READY,
+    TEST_MODE_IGNORE_READY,
+    TEST_MODE_NORMAL,
+    describe_test_mode,
+    read_test_mode,
+)
 from loop.uploader import monitor_and_display
 
 
@@ -18,6 +26,8 @@ class ReconnectBackoffTests(unittest.IsolatedAsyncioTestCase):
         host._next_connect_attempt = 0.0
         host._first_connect_failure_time = None
         host._status_check_needed = False
+        host._in_art_mode = True
+        host.test_mode = TEST_MODE_NORMAL
         return host
 
     def attach_failing_tv(self, host, error=None):
@@ -38,6 +48,7 @@ class ReconnectBackoffTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handshake_failure_is_logged_with_real_reason(self):
         host = self.make_host()
+        host._in_art_mode = True
         self.attach_failing_tv(host)
 
         self.assertFalse(await host.reconnect_tv(power_verified=True))
@@ -46,6 +57,30 @@ class ReconnectBackoffTests(unittest.IsolatedAsyncioTestCase):
         message = host.log.warning.call_args[0][0] % host.log.warning.call_args[0][1:]
         self.assertIn('ms.channel.ready', message)
         self.assertIn('attempt 1', message)
+
+    async def test_missing_ready_outside_art_mode_is_not_an_error(self):
+        # The art-app channel only completes its handshake in Art Mode, so a
+        # missing ms.channel.ready on HDMI is expected, not a fault.
+        host = self.make_host(watchdog_seconds=1800)
+        host._in_art_mode = False
+        self.attach_failing_tv(host)
+
+        self.assertFalse(await host.reconnect_tv(power_verified=True))
+
+        host.log.warning.assert_not_called()
+        host.log.info.assert_called_once()
+        self.assertIsNone(host._first_connect_failure_time)
+
+    async def test_expected_failures_never_trigger_the_watchdog(self):
+        host = self.make_host(watchdog_seconds=1)
+        host._in_art_mode = False
+        host._first_connect_failure_time = time.time() - 10000
+
+        with mock.patch('os._exit') as fake_exit:
+            host._note_connect_failure('no ms.channel.ready')
+
+        fake_exit.assert_not_called()
+        self.assertIsNone(host._first_connect_failure_time)
 
     async def test_cooldown_blocks_immediate_retry(self):
         host = self.make_host()
@@ -194,6 +229,7 @@ class LivenessProbeLoopTests(unittest.IsolatedAsyncioTestCase):
         host._refresh_in_progress = False
         host._tv_shutdown_signaled = False
         host._status_check_needed = False
+        host._tv_powered_on = True
         host._last_art_status_probe = 0
         host._in_art_mode = in_art_mode
         host._artmode_event = asyncio.Event()
@@ -250,6 +286,32 @@ class LivenessProbeLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls, [])
 
+    async def test_probe_skips_while_tv_is_powered_off(self):
+        # The main loop owns REST power polling while the TV is off, so probing
+        # here would only duplicate that work.
+        host = self.make_host()
+        host._tv_powered_on = False
+
+        calls = await self.run_one_pass(host)
+
+        self.assertEqual(calls, [])
+
+    async def test_probe_skips_after_standby_signal(self):
+        host = self.make_host()
+        host._tv_shutdown_signaled = True
+
+        calls = await self.run_one_pass(host)
+
+        self.assertEqual(calls, [])
+
+    async def test_probe_runs_while_power_state_is_unknown(self):
+        host = self.make_host()
+        host._tv_powered_on = None
+
+        calls = await self.run_one_pass(host)
+
+        self.assertTrue(calls)
+
     async def test_art_mode_transition_wakes_main_loop(self):
         host = self.make_host(in_art_mode=False)
 
@@ -288,6 +350,46 @@ class LivenessProbeLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(attempts)
         host.log.debug.assert_called()
+
+
+class TestModeParsingTests(unittest.TestCase):
+    """SAMSUNG_TV_ART_TEST_MODE is diagnostic, so bad input must never break boot."""
+
+    def read(self, raw, logger=None):
+        env = {} if raw is None else {'SAMSUNG_TV_ART_TEST_MODE': raw}
+        with mock.patch.dict(os.environ, env, clear=False):
+            if raw is None:
+                os.environ.pop('SAMSUNG_TV_ART_TEST_MODE', None)
+            return read_test_mode(logger)
+
+    def test_default_is_normal(self):
+        self.assertEqual(self.read(None), TEST_MODE_NORMAL)
+
+    def test_supported_modes_round_trip(self):
+        self.assertEqual(self.read('0'), TEST_MODE_NORMAL)
+        self.assertEqual(self.read('1'), TEST_MODE_IGNORE_READY)
+        self.assertEqual(self.read('3'), TEST_MODE_HANG_ON_READY)
+
+    def test_surrounding_whitespace_is_tolerated(self):
+        self.assertEqual(self.read('  1  '), TEST_MODE_IGNORE_READY)
+
+    def test_unknown_mode_falls_back_and_warns(self):
+        logger = mock.Mock()
+        self.assertEqual(self.read('2', logger), TEST_MODE_NORMAL)
+        logger.warning.assert_called_once()
+
+    def test_non_numeric_falls_back_and_warns(self):
+        logger = mock.Mock()
+        self.assertEqual(self.read('yes', logger), TEST_MODE_NORMAL)
+        logger.warning.assert_called_once()
+
+    def test_descriptions_exist_for_every_mode(self):
+        for mode in (
+            TEST_MODE_NORMAL,
+            TEST_MODE_IGNORE_READY,
+            TEST_MODE_HANG_ON_READY,
+        ):
+            self.assertNotEqual(describe_test_mode(mode), 'unknown')
 
 
 if __name__ == '__main__':

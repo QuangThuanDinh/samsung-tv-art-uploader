@@ -70,7 +70,13 @@ from .BingDailyWallpaperManager import (
 from .MuseumLabelManager import MuseumLabelManager
 from .mqtt_integration import MQTTIntegrationMixin, _MatteRejectedError
 from .pil_methods import PIL_methods
-from .tv_connection import FrameTVConnection
+from .tv_connection import (
+    FrameTVConnection,
+    TEST_MODE_HANG_ON_READY,
+    TEST_MODE_NORMAL,
+    describe_test_mode,
+    read_test_mode,
+)
 HAVE_PIL = False
 try:
     # Import Pillow submodules defensively. In some runtime environments a
@@ -162,6 +168,8 @@ class monitor_and_display(MQTTIntegrationMixin):
             5,
             int(os.environ.get('SAMSUNG_TV_ART_STATUS_PROBE_SECONDS', '15')),
         )
+        # Diagnostic only: controls how a missing ms.channel.ready is handled.
+        self.test_mode = read_test_mode(self.log)
         self._last_art_status_probe = 0
         self.update_time = int(max(0, update_time*60))   #convert minutes to seconds
         self.period = min(max(5, period), self.update_time) if self.update_time > 0 else period
@@ -398,6 +406,13 @@ class monitor_and_display(MQTTIntegrationMixin):
             self._loop = asyncio.get_running_loop()
         except Exception:
             self._loop = None
+        if self.test_mode != TEST_MODE_NORMAL:
+            self.log.warning(
+                'SAMSUNG_TV_ART_TEST_MODE=%d active: %s. This is a diagnostic '
+                'setting and must not be left enabled in normal operation.',
+                self.test_mode,
+                describe_test_mode(self.test_mode),
+            )
         # Create TV connection (may raise if TV offline)
         try:
             self._create_tv_connection()
@@ -543,13 +558,34 @@ class monitor_and_display(MQTTIntegrationMixin):
         """Record a handshake failure, log the real cause, and back off."""
         now = time.time()
         self._connect_failures += 1
-        if self._first_connect_failure_time is None:
+        # The com.samsung.art-app channel only completes its handshake while the
+        # TV is in Art Mode. On HDMI or live TV the socket opens but never emits
+        # ms.channel.ready, which is expected Samsung behaviour rather than a
+        # fault, so it must not be escalated or counted toward the watchdog.
+        expected = self._in_art_mode is not True
+        if expected:
+            self._first_connect_failure_time = None
+        elif self._first_connect_failure_time is None:
             self._first_connect_failure_time = now
         delay = min(
             self.reconnect_delay * (2 ** (self._connect_failures - 1)),
             self.connect_retry_max_seconds,
         )
         self._next_connect_attempt = now + delay
+        if expected:
+            log_fn = (
+                self.log.info
+                if self._connect_failures == 1
+                else self.log.debug
+            )
+            log_fn(
+                'Art channel unavailable while TV is not in Art Mode '
+                '(attempt %d, next retry in %ss): %s',
+                self._connect_failures,
+                int(delay),
+                reason,
+            )
+            return
         # The first few failures and every tenth afterwards are visible, so the
         # underlying cause is never silently swallowed the way it used to be.
         log_fn = (
@@ -600,22 +636,31 @@ class monitor_and_display(MQTTIntegrationMixin):
                     continue
                 if self._tv_shutdown_signaled:
                     continue
+                if self._tv_powered_on is False:
+                    # The main loop already polls REST on its own cadence while
+                    # the TV is off, and it clears this flag as soon as power
+                    # returns. Probing here would only duplicate that work.
+                    continue
                 self._log_art_liveness_probe()
                 previous = self._in_art_mode
                 started = time.monotonic()
                 in_artmode = await self.safe_in_artmode()
                 self._last_art_status_probe = time.time()
-                # Elapsed covers the REST power probe plus the Art request, so
-                # the per-step timings logged by the connection are the ones to
-                # compare when diagnosing slowness.
+                # _in_art_mode is None when the Art channel could not be reached
+                # at all, which is different from the TV genuinely reporting that
+                # Art Mode is off. Reporting both as False was misleading.
+                if self._in_art_mode is None:
+                    outcome = 'unknown (art channel unreachable)'
+                else:
+                    outcome = str(bool(in_artmode))
                 self.log.info(
-                    'Art liveness probe answered: art_mode=%s (socket=%s, '
+                    'Art liveness probe result: art_mode=%s (socket=%s, '
                     'total=%.2fs incl. REST probe)',
-                    in_artmode,
+                    outcome,
                     self._describe_socket_state(),
                     time.monotonic() - started,
                 )
-                if bool(in_artmode) != bool(previous):
+                if self._in_art_mode is not None and bool(in_artmode) != bool(previous):
                     # Wake the main loop so a transition is acted on promptly.
                     self._status_check_needed = True
                     self._artmode_event.set()
@@ -671,7 +716,12 @@ class monitor_and_display(MQTTIntegrationMixin):
                 self._reset_connect_backoff()
                 self.tv.retire()
                 return False
-            await asyncio.wait_for(self.tv.start_listening(), timeout=15)
+            if self.test_mode == TEST_MODE_HANG_ON_READY:
+                # No outer timeout, so the stall is observable exactly as it is in
+                # homebridge-samsung-tizen rather than being cut short at 15s.
+                await self.tv.start_listening()
+            else:
+                await asyncio.wait_for(self.tv.start_listening(), timeout=15)
             if self.tv.is_alive():
                 self._note_connect_success()
                 self.log.info('Connected to TV with a fresh WebSocket client')
