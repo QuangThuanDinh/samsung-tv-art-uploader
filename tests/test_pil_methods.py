@@ -33,11 +33,14 @@ class PILMethodsTests(unittest.TestCase):
             monitor.folder = collection
 
             loaded = helper.load_files()
-            self.addCleanup(
-                lambda: [image.close() for image in loaded.values()]
-            )
-
-            self.assertEqual(list(loaded), ['painting.jpg'])
+            try:
+                self.assertEqual(list(loaded), ['painting.jpg'])
+            finally:
+                # load_files returns lazily-opened PIL images. They must be
+                # closed before the temp directory is removed, or Windows
+                # refuses to unlink the still-open file.
+                for image in loaded.values():
+                    image.close()
 
 
 if __name__ == '__main__':

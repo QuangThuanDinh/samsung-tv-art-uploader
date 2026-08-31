@@ -21,6 +21,7 @@ class LoggingSamsungTVAsyncArtTests(unittest.IsolatedAsyncioTestCase):
         client._start_lock = asyncio.Lock()
         client._request_lock = asyncio.Lock()
         client._suppress_disconnect_log = False
+        client._disconnect_callback = None
         client._ready_timeout = 1.0
         client._request_timeout = 1.0
         client._test_mode = 0
@@ -90,6 +91,10 @@ class LoggingSamsungTVAsyncArtTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_waits_for_ready_event(self):
         client = self.make_client()
         client._channel_ready.clear()
+        # No listener yet, so start_listening must actually start one. A live
+        # listener is deliberately reused instead, which would never set ready.
+        client._recv_loop = None
+        client._active_listener = None
         client.is_alive = mock.Mock(return_value=True)
         client.process_event = mock.AsyncMock()
         client.get_artmode = mock.AsyncMock(return_value='on')

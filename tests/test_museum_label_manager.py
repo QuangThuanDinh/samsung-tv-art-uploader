@@ -143,7 +143,9 @@ class MuseumLabelManagerTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(derivative))
         self.assertEqual(first['processed'], 1)
         self.assertTrue(any(
-            'Museum Label generating 1/1: Monet/painting.png' in message
+            'Museum Label generating 1/1: {}'.format(
+                os.path.join('Monet', 'painting.png')
+            ) in message
             for message in logs.output
         ))
         self.assertEqual(second['processed'], 0)

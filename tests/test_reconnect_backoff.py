@@ -236,6 +236,17 @@ class LivenessProbeLoopTests(unittest.IsolatedAsyncioTestCase):
         host.tv = mock.Mock(retired=False, socket_state='OPEN', channel_ready=True)
         return host
 
+    async def pump(self, predicate=None, passes=50):
+        """Yield to the event loop until the probe loop makes progress.
+
+        A single `sleep(0)` only gets the task as far as the loop's own
+        `await asyncio.sleep(...)`, so the probe would never be reached.
+        """
+        for _ in range(passes):
+            await asyncio.sleep(0)
+            if predicate is not None and predicate():
+                return
+
     async def run_one_pass(self, host):
         """Run exactly one probe iteration, then stop the loop."""
         calls = []
@@ -248,7 +259,7 @@ class LivenessProbeLoopTests(unittest.IsolatedAsyncioTestCase):
 
         host.safe_in_artmode = probe
         task = asyncio.create_task(host._art_liveness_loop())
-        await asyncio.sleep(0)
+        await self.pump(lambda: bool(calls))
         task.cancel()
         try:
             await task
@@ -321,7 +332,7 @@ class LivenessProbeLoopTests(unittest.IsolatedAsyncioTestCase):
 
         host.safe_in_artmode = probe
         task = asyncio.create_task(host._art_liveness_loop())
-        await asyncio.sleep(0)
+        await self.pump(lambda: host._artmode_event.is_set())
         task.cancel()
         try:
             await task
@@ -341,14 +352,16 @@ class LivenessProbeLoopTests(unittest.IsolatedAsyncioTestCase):
 
         host.safe_in_artmode = probe
         task = asyncio.create_task(host._art_liveness_loop())
-        await asyncio.sleep(0)
+        await self.pump(lambda: len(attempts) >= 2)
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
 
-        self.assertTrue(attempts)
+        # Surviving means the loop probes again after a failure, not merely that
+        # it probed once.
+        self.assertGreaterEqual(len(attempts), 2)
         host.log.debug.assert_called()
 
 
