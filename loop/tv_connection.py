@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import json
 import os
 import socket
@@ -13,6 +12,11 @@ from samsungtvws.event import MS_CHANNEL_CONNECT_EVENT, MS_CHANNEL_READY_EVENT
 
 _REDACTED = '[REDACTED]'
 _SENSITIVE_KEY_PARTS = ('token', 'password', 'secret', 'credential')
+
+# Strong references to in-flight close tasks. asyncio keeps only weak references
+# to tasks, so without this a close can be garbage collected mid-execution and
+# leave the socket open on the TV.
+_PENDING_CLOSE_TASKS = set()
 
 
 def _sanitize_websocket_payload(value):
@@ -116,7 +120,6 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
         self._channel_ready = asyncio.Event()
         self._start_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
-        self._heartbeat_task = None
         self._suppress_disconnect_log = False
         self._active_listener = None
         self._disconnect_callback = None
@@ -126,6 +129,12 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
             10,
         )
         self._test_mode = read_test_mode(response_logger)
+        # A 2s budget was long enough to time out on a healthy but busy TV, and
+        # each timeout used to discard a working socket.
+        self._request_timeout = self._read_positive_seconds(
+            'SAMSUNG_TV_ART_REQUEST_TIMEOUT_SECONDS',
+            8,
+        )
         super().__init__(*args, **kwargs)
 
     def _read_positive_seconds(self, name, default):
@@ -195,30 +204,37 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
                 and listener_running
                 and self._channel_ready.is_set()
             ):
-                self._ensure_heartbeat()
                 return False
             if not self.is_alive():
                 try:
                     powered_on = await super().on()
                 except Exception as exc:
-                    self._retired = True
                     await self.close()
                     raise ConnectionError(
                         'TV REST power probe failed'
                     ) from exc
                 if not powered_on:
+                    # The TV being off is the one case where the socket is
+                    # genuinely gone; retiring here is correct.
                     self._retired = True
                     await self.close()
                     raise ConnectionError('TV is powered off')
                 await self.open()
+                listener_running = False
 
-            started = await SamsungTVWSAsyncConnection.start_listening(
-                self,
-                self.process_event,
-            )
-            if started and self._recv_loop is not None:
-                self._active_listener = self._recv_loop
-                self._recv_loop.add_done_callback(self._on_listener_done)
+            if listener_running:
+                # A live listener is reused. Re-entering the library's
+                # start_listening would spawn a second receive loop on the same
+                # socket, and every extra socket costs memory on the TV.
+                started = True
+            else:
+                started = await SamsungTVWSAsyncConnection.start_listening(
+                    self,
+                    self.process_event,
+                )
+                if started and self._recv_loop is not None:
+                    self._active_listener = self._recv_loop
+                    self._recv_loop.add_done_callback(self._on_listener_done)
             if self._test_mode == TEST_MODE_HANG_ON_READY:
                 # Reproduces homebridge-samsung-tizen: its _open() awaits
                 # ms.channel.ready with no timeout and registers no close
@@ -239,7 +255,11 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
                     )
                 except asyncio.TimeoutError as exc:
                     if self._test_mode != TEST_MODE_IGNORE_READY:
-                        await self.close()
+                        # Deliberately leave the socket open. Tearing it down and
+                        # opening a replacement every retry is what accumulates
+                        # sessions on the TV until it stops accepting new ones.
+                        # The listener stays live, so a late ms.channel.ready is
+                        # still picked up and the next call reuses this socket.
                         raise ConnectionError(
                             'TV Art WebSocket did not emit ms.channel.ready within '
                             f'{self._ready_timeout:g}s'
@@ -273,23 +293,12 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
                     raise ConnectionError(
                         'TV Art WebSocket did not provide a connection ID'
                     )
-            self._ensure_heartbeat()
         if started:
             try:
                 await self.get_artmode()
             except AssertionError:
                 pass
         return started
-
-    def _ensure_heartbeat(self):
-        if (
-            self.is_alive()
-            and (
-                self._heartbeat_task is None
-                or self._heartbeat_task.done()
-            )
-        ):
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     def _on_listener_done(self, listener):
         if (
@@ -355,15 +364,6 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
 
     async def close(self):
         self._suppress_disconnect_log = True
-        heartbeat_task = self._heartbeat_task
-        self._heartbeat_task = None
-        if (
-            heartbeat_task is not None
-            and heartbeat_task is not asyncio.current_task()
-        ):
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
         try:
             await super().close()
         finally:
@@ -371,42 +371,14 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
             self._channel_ready.clear()
             self._active_listener = None
 
-    async def _heartbeat_loop(self):
-        interval = self._read_positive_seconds(
-            'SAMSUNG_TV_ART_HEARTBEAT_SECONDS',
-            6,
-        )
-        timeout = self._read_positive_seconds(
-            'SAMSUNG_TV_ART_HEARTBEAT_TIMEOUT_SECONDS',
-            2,
-        )
-        try:
-            while self.is_alive() and not self._retired:
-                await asyncio.sleep(interval)
-                if not self.is_alive() or self._retired:
-                    return
-                pong_waiter = await self.connection.ping()
-                await asyncio.wait_for(pong_waiter, timeout=timeout)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self._response_logger.info(
-                'TV Art WebSocket disconnected: heartbeat failed (%s): %s',
-                type(exc).__name__,
-                exc,
-            )
-            self._notify_disconnect()
-            await self.close()
-        finally:
-            if self._heartbeat_task is asyncio.current_task():
-                self._heartbeat_task = None
-
     async def _send_art_request(
         self,
         request_data,
         wait_for_event=None,
-        timeout=2,
+        timeout=None,
     ):
+        if timeout is None:
+            timeout = self._request_timeout
         await self.start_listening()
         async with self._request_lock:
             listener_running = (
@@ -524,6 +496,11 @@ class FrameTVConnection:
         self._power_state_callback = power_state_callback
         self._retired = False
         self._client._disconnect_callback = self._handle_art_disconnect
+        self._artmode_failures = 0
+        self._artmode_failure_limit = max(
+            1,
+            int(os.environ.get('SAMSUNG_TV_ART_REQUEST_FAILURE_LIMIT', '3')),
+        )
         self._register_artmode_callbacks()
 
     def __getattr__(self, name):
@@ -554,9 +531,15 @@ class FrameTVConnection:
         self._retired = True
         self._client._retired = True
         try:
-            asyncio.create_task(self._client.close())
+            task = asyncio.create_task(self._client.close())
         except RuntimeError:
-            pass
+            return
+        # The event loop holds only weak references to tasks, so an unreferenced
+        # close task can be garbage collected before the socket is torn down.
+        # That leaks the session on the TV, which is what eventually makes it
+        # refuse new connections until it is power-cycled.
+        _PENDING_CLOSE_TASKS.add(task)
+        task.add_done_callback(_PENDING_CLOSE_TASKS.discard)
 
     @property
     def retired(self):
@@ -642,6 +625,7 @@ class FrameTVConnection:
                     'Art request get_artmode_status answered in %.2fs',
                     elapsed,
                 )
+                self._artmode_failures = 0
                 return str(status).lower() == 'on'
             except Exception as exc:
                 last_error = exc
@@ -663,5 +647,23 @@ class FrameTVConnection:
                 last_error,
             )
             return False
-        self.retire()
+        self._artmode_failures += 1
+        # Retiring on the first unanswered request threw away sockets that were
+        # merely slow, and every replacement socket costs memory on the TV. Only
+        # give up once the channel has failed repeatedly.
+        if self._artmode_failures >= self._artmode_failure_limit:
+            self._logger.info(
+                'Retiring Art WebSocket after %d consecutive unanswered '
+                'get_artmode_status requests: %s',
+                self._artmode_failures,
+                last_error,
+            )
+            self.retire()
+            raise last_error if last_error else AssertionError('artmode query failed')
+        self._logger.debug(
+            'get_artmode_status unanswered (%d/%d); keeping the socket: %s',
+            self._artmode_failures,
+            self._artmode_failure_limit,
+            last_error,
+        )
         raise last_error if last_error else AssertionError('artmode query failed')

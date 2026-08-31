@@ -749,7 +749,11 @@ class monitor_and_display(MQTTIntegrationMixin):
                 powered_on = await self.tv.is_powered_on()
             except Exception as e:
                 self.log.debug('TV REST power probe failed: %s', e)
-                self.tv.retire()
+                # A failed REST probe does not prove the Art socket is dead, and
+                # discarding a live socket here forced a replacement that the TV
+                # has to allocate memory for. Leave the connection alone; the
+                # listener and the Art request threshold retire it if it is
+                # genuinely gone.
                 self._tv_powered_on = None
                 self._in_art_mode = None
                 self.consecutive_failures += 1

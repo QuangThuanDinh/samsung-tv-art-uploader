@@ -20,9 +20,10 @@ class LoggingSamsungTVAsyncArtTests(unittest.IsolatedAsyncioTestCase):
         client._channel_ready.set()
         client._start_lock = asyncio.Lock()
         client._request_lock = asyncio.Lock()
-        client._heartbeat_task = None
         client._suppress_disconnect_log = False
         client._ready_timeout = 1.0
+        client._request_timeout = 1.0
+        client._test_mode = 0
         client._recv_loop = mock.Mock(done=mock.Mock(return_value=False))
         client._active_listener = client._recv_loop
         client.is_alive = mock.Mock(return_value=True)
@@ -89,7 +90,6 @@ class LoggingSamsungTVAsyncArtTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_waits_for_ready_event(self):
         client = self.make_client()
         client._channel_ready.clear()
-        client._heartbeat_task = mock.Mock(done=mock.Mock(return_value=False))
         client.is_alive = mock.Mock(return_value=True)
         client.process_event = mock.AsyncMock()
         client.get_artmode = mock.AsyncMock(return_value='on')
