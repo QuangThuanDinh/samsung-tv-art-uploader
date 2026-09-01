@@ -1397,6 +1397,105 @@ class MQTTIntegrationMixin:
                 except Exception:
                     pass
 
+    async def _upload_single_image(
+        self,
+        path,
+        req_id=None,
+        ack_cmd='slideshow/upload/add',
+    ):
+        """Upload one image and display it, changing nothing else.
+
+        Deliberately leaves slideshow_override, max_uploads, the rotation timer
+        and the daily-mode schedule untouched, and never deletes anything that
+        is already on the TV. Because the path is not added to the override,
+        get_content_ids() keeps it out of the rotation pool, and a later Apply
+        or daily sync reclaims it.
+        """
+        def ack(status, msg):
+            self._publish_ack(ack_cmd, status, msg, req_id)
+
+        if not os.path.isfile(os.path.join(self.media_root, path)):
+            ack('error', 'Image no longer exists locally')
+            return
+
+        async with self._tv_state_lock:
+            if self._refresh_in_progress or self._collections_sync_running:
+                ack('error', 'Another upload or refresh is already running')
+                return
+            self._refresh_in_progress = True
+        try:
+            if self.tv is None or not await self.safe_in_artmode(
+                allow_during_refresh=True
+            ):
+                # Nothing is persisted for this action, so there is no pending
+                # intent to resume; the user retries once the TV is available.
+                ack('error', 'TV is not in Art Mode; nothing was uploaded')
+                return
+
+            live_entries = await self.get_tv_content_entries('MY-C0002')
+            if live_entries is None:
+                raise RuntimeError('Unable to verify existing TV uploads')
+            live_by_id = {
+                entry.get('content_id'): entry
+                for entry in live_entries
+                if isinstance(entry, dict) and entry.get('content_id')
+            }
+
+            content_id = await self._reusable_upload_content_id(path, live_by_id)
+            if content_id:
+                self.log.info(
+                    'Upload skipped: %s is already on the TV as %s',
+                    path,
+                    content_id,
+                )
+            else:
+                ack('progress', 'Uploading image...')
+                await self.upload_files([path])
+                content_id = self._cached_content_id(path)
+                if not content_id:
+                    raise RuntimeError('Upload did not complete')
+                self.write_program_data()
+
+            if content_id != self.current_content_id:
+                await self.tv.select_image(content_id)
+                self.current_content_id = content_id
+                self.shown_content_ids.add(content_id)
+                await self.update_ha_selected_artwork(content_id)
+            ack('ok', 'Image uploaded and displayed')
+        except Exception as e:
+            self.log.warning('Error uploading single image %s: %s', path, e)
+            ack('error', str(e))
+        finally:
+            self._refresh_in_progress = False
+            self._publish_slideshow_state()
+            self._publish_slideshow_available()
+            try:
+                await self._publish_current_artwork_state(force=True)
+            except Exception:
+                pass
+
+    def _cached_content_id(self, path):
+        for key, record in self.uploaded_files.items():
+            if record.get('path_rel', key) == path:
+                return record.get('content_id')
+        return None
+
+    async def _reusable_upload_content_id(self, path, live_by_id):
+        """Return the content_id to reuse, or None when a fresh upload is due.
+
+        Reuses only when the cache is current for this path, the desired matte
+        still matches, and the TV genuinely still holds that content_id.
+        """
+        if self._slideshow_paths_requiring_upload([path]):
+            return None
+        for key, record in self.uploaded_files.items():
+            if record.get('path_rel', key) != path:
+                continue
+            if not await self._cached_upload_matches_tv(path, record, live_by_id):
+                return None
+            return record.get('content_id')
+        return None
+
     def _write_overrides(self, updates: dict) -> bool:
         """Write overrides to /data/overrides.env, merging with existing content."""
         try:
@@ -2030,6 +2129,23 @@ class MQTTIntegrationMixin:
                         cmd,
                         'error',
                         'Failed to queue Museum Label generation',
+                        req_id,
+                    )
+                return
+            if cmd == 'slideshow/upload/add':
+                path = str((data or {}).get('path', '')).strip()
+                if not path:
+                    self._publish_ack(cmd, 'error', 'No path provided', req_id)
+                    return
+                fut = self._schedule_command_coro(
+                    self._upload_single_image(path, req_id=req_id, ack_cmd=cmd),
+                    'slideshow/upload/add',
+                )
+                if not fut:
+                    self._publish_ack(
+                        cmd,
+                        'error',
+                        'Failed to queue the upload',
                         req_id,
                     )
                 return

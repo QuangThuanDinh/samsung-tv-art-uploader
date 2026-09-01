@@ -954,6 +954,21 @@
                   );
                 }
               }
+              if (cmd === 'slideshow/upload/add' && _slUploadReq && String(ack.req_id || '') === String(_slUploadReq)) {
+                if (status === 'queued' || status === 'started' || status === 'progress') {
+                  _setSlModalMsg(ack.message || 'Uploading...', false, 0);
+                } else {
+                  _slUploadReq = null;
+                  const $ub = _slModalEl && _slModalEl.querySelector('.sl-modal-upload');
+                  if ($ub) { $ub.disabled = false; $ub.textContent = 'Upload'; }
+                  _setSlModalMsg(
+                    status === 'ok'
+                      ? (ack.message || 'Image uploaded and displayed.')
+                      : `Upload failed: ${ack.message || 'unknown'}`,
+                    status !== 'ok'
+                  );
+                }
+              }
               if (cmd === 'settings/set') {
                 $envMsg.textContent = status === 'ok' ? 'Settings applied.' : `Settings error: ${ack.message||'unknown'}`;
               }
@@ -2422,6 +2437,19 @@
     let _slModalEl = null;
     let _slModalList = [];
     let _slModalIdx = 0;
+    let _slUploadReq = null;
+    // Writes to the modal status line. ttl of 0 keeps the message until it is
+    // replaced, which is what the in-flight upload states need.
+    function _setSlModalMsg(text, isError, ttl = 6000) {
+      const $mm = _slModalEl && _slModalEl.querySelector('.sl-modal-msg');
+      if (!$mm) return;
+      clearTimeout($mm._clearTimer);
+      $mm.textContent = text;
+      $mm.style.color = isError ? '' : '#8fd694';
+      if (ttl > 0) {
+        $mm._clearTimer = setTimeout(() => { if ($mm) { $mm.textContent = ''; } }, ttl);
+      }
+    }
     let _slModalPreviousFocus = null;
     // Draft matte choices are preview-only until the modal Apply button is used.
     const _modalMatteDrafts = Object.create(null);
@@ -2495,6 +2523,11 @@
         $apply.style.display = '';
         $apply.disabled = false;
       }
+      const $upload = _slModalEl.querySelector('.sl-modal-upload');
+      if ($upload) {
+        $upload.disabled = !!_slUploadReq;
+        $upload.textContent = _slUploadReq ? 'Uploading...' : 'Upload';
+      }
       const $prev = _slModalEl.querySelector('.sl-modal-nav.prev');
       const $next = _slModalEl.querySelector('.sl-modal-nav.next');
       if ($prev) $prev.disabled = _slModalIdx <= 0;
@@ -2533,6 +2566,7 @@
             <select id="sl-modal-matte-type"></select>
             <div id="sl-modal-matte-color" class="sl-matte-swatches" role="radiogroup" aria-label="Matte color"></div>
             <button type="button" class="sl-modal-apply" title="Save this matte choice and add the image to the slideshow selection.">Apply</button>
+            <button type="button" class="sl-modal-upload" title="Upload this image to the TV and display it now, without changing the slideshow selection or rotation.">Upload</button>
           </div>
           <div class="sl-modal-matte-lock"></div>
           <div class="sl-modal-msg" role="status" aria-live="polite"></div>
@@ -2624,6 +2658,32 @@
             $mm._clearTimer = setTimeout(()=>{ if($mm){ $mm.textContent=''; } }, 5000);
           }
           _renderSlModalContents();
+        });
+      }
+
+      // Upload sends this one image to the TV and displays it immediately.
+      // It intentionally leaves the slideshow selection, the rotation order
+      // and the Bing daily schedule untouched, so the next Apply or daily
+      // sync reclaims the image.
+      const $upload = overlay.querySelector('.sl-modal-upload');
+      if ($upload) {
+        $upload.addEventListener('click', () => {
+          const cur = _slModalList[_slModalIdx];
+          if (!cur || _slUploadReq) return;
+          if (typeof client === 'undefined' || !client) {
+            _setSlModalMsg('Not connected to MQTT.', true);
+            return;
+          }
+          const reqId = 'ul-' + Date.now();
+          _slUploadReq = reqId;
+          $upload.disabled = true;
+          $upload.textContent = 'Uploading...';
+          _setSlModalMsg('Sending image to the TV...', false, 0);
+          client.publish(
+            TOPIC_CMD_PREFIX + '/slideshow/upload/add',
+            JSON.stringify({ path: cur.path, req_id: reqId }),
+            { qos: 1 }
+          );
         });
       }
 
