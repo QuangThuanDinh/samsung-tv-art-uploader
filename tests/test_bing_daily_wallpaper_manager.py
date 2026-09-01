@@ -500,9 +500,16 @@ class BingDailyWallpaperManagerTests(unittest.TestCase):
         )
         self.assertEqual(self.host.acks[-1][1], 'error')
 
+    def _write_media(self, relative_path):
+        full = os.path.join(self.media_root, relative_path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, 'wb') as handle:
+            handle.write(b'image-bytes')
+        return relative_path
+
     def test_daily_rollover_marks_existing_daily_mode_pending(self):
         old_path = f'{BING_COLLECTION_ID}/OHR.Old_UHD.jpg'
-        new_path = f'{BING_COLLECTION_ID}/OHR.New_UHD.jpg'
+        new_path = self._write_media(f'{BING_COLLECTION_ID}/OHR.New_UHD.jpg')
         self.host.selected_collections = [BING_COLLECTION_ID]
         self.host.slideshow_override = [old_path]
         self.host.uploaded_files = {
@@ -525,6 +532,110 @@ class BingDailyWallpaperManagerTests(unittest.TestCase):
         self.assertEqual(self.host.slideshow_override, [new_path])
         self.assertTrue(self.host.slideshow_override_pending)
         self.assertTrue(self.host.slideshow_override_force_reupload)
+
+    def _daily_result(self, path, status='unchanged'):
+        return BingDailyResult(
+            status=status,
+            date='20260901',
+            relative_path=path,
+            metadata={
+                'filename': os.path.basename(path),
+                'relative_path': path,
+                'startdate': '20260901',
+            },
+        )
+
+    def test_stale_selection_is_corrected_on_a_later_tick(self):
+        # ensure_today reports 'unchanged' for the rest of the day once the
+        # image is cached. If the download landed while daily mode was briefly
+        # inactive, the selection has to be corrected on a later tick or it
+        # stays on yesterday's image until the next rollover.
+        old_path = f'{BING_COLLECTION_ID}/OHR.Old_UHD.jpg'
+        new_path = self._write_media(f'{BING_COLLECTION_ID}/OHR.New_UHD.jpg')
+        self.host.selected_collections = [BING_COLLECTION_ID]
+        self.host.slideshow_override = [old_path]
+        self.host.uploaded_files = {
+            old_path: {'path_rel': old_path, 'content_id': '1'}
+        }
+
+        with mock.patch.object(
+            self.manager,
+            'ensure_today',
+            return_value=self._daily_result(new_path),
+        ):
+            asyncio.run(self.manager.tick())
+
+        self.assertEqual(self.host.slideshow_override, [new_path])
+        self.assertTrue(self.host.slideshow_override_pending)
+
+    def test_matching_selection_is_left_alone(self):
+        path = self._write_media(f'{BING_COLLECTION_ID}/OHR.Today_UHD.jpg')
+        self.host.selected_collections = [BING_COLLECTION_ID]
+        self.host.slideshow_override = [path]
+        self.host.uploaded_files = {path: {'path_rel': path, 'content_id': '1'}}
+        self.host.slideshow_override_pending = False
+
+        with mock.patch.object(
+            self.manager,
+            'ensure_today',
+            return_value=self._daily_result(path),
+        ):
+            asyncio.run(self.manager.tick())
+
+        self.assertEqual(self.host.slideshow_override, [path])
+        self.assertFalse(self.host.slideshow_override_pending)
+
+    def test_selection_is_untouched_outside_daily_mode(self):
+        path = self._write_media(f'{BING_COLLECTION_ID}/OHR.Today_UHD.jpg')
+        self.host.selected_collections = ['Monet']
+        self.host.slideshow_override = ['Monet/Water_Lilies.jpg']
+
+        with mock.patch.object(
+            self.manager,
+            'ensure_today',
+            return_value=self._daily_result(path),
+        ):
+            asyncio.run(self.manager.tick())
+
+        self.assertEqual(
+            self.host.slideshow_override,
+            ['Monet/Water_Lilies.jpg'],
+        )
+        self.assertFalse(self.host.slideshow_override_pending)
+
+    def test_missing_image_does_not_become_the_selection(self):
+        # Selecting a path that was pruned from disk would only fail later in
+        # _apply_slideshow_override.
+        old_path = f'{BING_COLLECTION_ID}/OHR.Old_UHD.jpg'
+        missing = f'{BING_COLLECTION_ID}/OHR.Gone_UHD.jpg'
+        self.host.selected_collections = [BING_COLLECTION_ID]
+        self.host.slideshow_override = [old_path]
+
+        with mock.patch.object(
+            self.manager,
+            'ensure_today',
+            return_value=self._daily_result(missing),
+        ):
+            asyncio.run(self.manager.tick())
+
+        self.assertEqual(self.host.slideshow_override, [old_path])
+        self.assertFalse(self.host.slideshow_override_pending)
+
+    def test_failed_lookup_does_not_change_the_selection(self):
+        old_path = f'{BING_COLLECTION_ID}/OHR.Old_UHD.jpg'
+        new_path = self._write_media(f'{BING_COLLECTION_ID}/OHR.New_UHD.jpg')
+        self.host.selected_collections = [BING_COLLECTION_ID]
+        self.host.slideshow_override = [old_path]
+
+        with mock.patch.object(
+            self.manager,
+            'ensure_today',
+            return_value=self._daily_result(new_path, status='failed'),
+        ):
+            asyncio.run(self.manager.tick())
+
+        self.assertEqual(self.host.slideshow_override, [old_path])
+        self.assertFalse(self.host.slideshow_override_pending)
 
 
 if __name__ == '__main__':

@@ -145,18 +145,37 @@ class BingDailyWallpaperManager:
                     self.host._collection_file_cache.pop(self.collection_dir, None)
                 self.host._publish_collections_state()
                 self.host._publish_slideshow_available()
-                if (
-                    self.is_daily_mode()
-                    and self.host.slideshow_override != [result.relative_path]
-                ):
-                    self._mark_sync_pending(
-                        result.relative_path,
-                        force_reupload=self._requires_full_replace(
-                            result.relative_path
-                        ),
-                    )
+
+            self._reconcile_daily_selection(result)
         except Exception as exc:
             self.log.warning('Bing Daily Wallpaper loop check failed: %s', exc)
+
+    def _reconcile_daily_selection(self, result):
+        """Keep the daily selection pointing at the image the TV should hold.
+
+        The selection must track what is uploaded to the TV, so this runs on
+        every tick rather than only on the tick that downloaded the image.
+        `ensure_today` reports 'unchanged' for the rest of the day once the
+        image is cached, so a download that lands while daily mode is briefly
+        inactive - during startup, or while a refresh holds the loop - used to
+        leave yesterday's image selected until the next rollover.
+        """
+        path = result.relative_path
+        if not path or result.status == 'failed':
+            return
+        if not os.path.isfile(os.path.join(self.host.media_root, path)):
+            return
+        if not self.is_daily_mode() or self.host.slideshow_override == [path]:
+            return
+        self.log.info(
+            'Daily mode selection is stale (%s); selecting %s',
+            self.host.slideshow_override,
+            path,
+        )
+        self._mark_sync_pending(
+            path,
+            force_reupload=self._requires_full_replace(path),
+        )
 
     async def apply_selection(
         self,
