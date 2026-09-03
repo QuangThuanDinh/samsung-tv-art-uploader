@@ -41,66 +41,17 @@ def _sanitize_websocket_payload(value):
     return value
 
 
-# Diagnostic switch for reproducing how different clients treat a missing
-# ms.channel.ready. The com.samsung.art-app channel only completes its handshake
-# while the TV is in Art Mode, so on HDMI the socket opens but never becomes
-# ready. These modes make that behaviour comparable at runtime.
-TEST_MODE_NORMAL = 0          # Time out, tear the socket down, retry with backoff.
-TEST_MODE_IGNORE_READY = 1    # Time out, then carry on as if the channel were ready.
-TEST_MODE_HANG_ON_READY = 2   # Wait forever, reproducing homebridge-samsung-tizen.
+# The com.samsung.art-app channel completes its handshake independently of Art
+# Mode: a healthy TV emits ms.channel.ready even while sitting on HDMI. A ready
+# that never arrives therefore means the channel is wedged, not that Art Mode is
+# simply off.
+class ArtChannelNotReadyError(ConnectionError):
+    """The socket is open but ms.channel.ready has not arrived yet.
 
-_TEST_MODES = (
-    TEST_MODE_NORMAL,
-    TEST_MODE_IGNORE_READY,
-    TEST_MODE_HANG_ON_READY,
-)
-
-# 3 was the value first published for the hang mode; keep it working so an
-# existing configuration does not silently fall back to normal behaviour.
-_TEST_MODE_ALIASES = {3: TEST_MODE_HANG_ON_READY}
-
-TEST_MODE_ENV_VAR = 'SAMSUNG_TV_ART_TEST_MODE'
-
-_TEST_MODE_DESCRIPTIONS = {
-    TEST_MODE_NORMAL: 'normal (timeout, drop the socket, retry)',
-    TEST_MODE_IGNORE_READY: 'ignore-ready (timeout, then proceed anyway)',
-    TEST_MODE_HANG_ON_READY: 'hang-on-ready (wait forever, homebridge behaviour)',
-}
-
-
-def read_test_mode(logger=None):
-    """Resolve SAMSUNG_TV_ART_TEST_MODE, falling back to normal behaviour."""
-    raw = os.environ.get(TEST_MODE_ENV_VAR, str(TEST_MODE_NORMAL)).strip()
-    try:
-        mode = int(raw)
-    except ValueError:
-        mode = None
-    if mode in _TEST_MODE_ALIASES:
-        mode = _TEST_MODE_ALIASES[mode]
-        if logger is not None:
-            logger.warning(
-                '%s=%s is deprecated; use %d instead (%s).',
-                TEST_MODE_ENV_VAR,
-                raw,
-                mode,
-                _TEST_MODE_DESCRIPTIONS[mode],
-            )
-    if mode not in _TEST_MODES:
-        if logger is not None:
-            logger.warning(
-                'Invalid %s value %r; using %d (%s). Valid values are %s.',
-                TEST_MODE_ENV_VAR,
-                raw,
-                TEST_MODE_NORMAL,
-                _TEST_MODE_DESCRIPTIONS[TEST_MODE_NORMAL],
-                ', '.join(str(value) for value in _TEST_MODES),
-            )
-        return TEST_MODE_NORMAL
-    return mode
-
-
-def describe_test_mode(mode):
-    return _TEST_MODE_DESCRIPTIONS.get(mode, 'unknown')
+    Distinct from a general ConnectionError because retrying immediately is
+    pointless: a second attempt would just wait the same timeout for the same
+    event on the same socket.
+    """
 
 
 class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
@@ -128,7 +79,6 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
             'SAMSUNG_TV_ART_READY_TIMEOUT_SECONDS',
             10,
         )
-        self._test_mode = read_test_mode(response_logger)
         # A 2s budget was long enough to time out on a healthy but busy TV, and
         # each timeout used to discard a working socket.
         self._request_timeout = self._read_positive_seconds(
@@ -235,64 +185,26 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
                 if started and self._recv_loop is not None:
                     self._active_listener = self._recv_loop
                     self._recv_loop.add_done_callback(self._on_listener_done)
-            if self._test_mode == TEST_MODE_HANG_ON_READY:
-                # Reproduces homebridge-samsung-tizen: its _open() awaits
-                # ms.channel.ready with no timeout and registers no close
-                # handler, so a TV that never starts the art app leaves the
-                # caller pending forever and its refresh loop dies with it.
-                self._response_logger.warning(
-                    'TEST MODE %d (%s): awaiting ms.channel.ready with no '
-                    'timeout; this call blocks until Art Mode starts',
-                    self._test_mode,
-                    describe_test_mode(self._test_mode),
+            try:
+                await asyncio.wait_for(
+                    self._channel_ready.wait(),
+                    timeout=self._ready_timeout,
                 )
-                await self._channel_ready.wait()
-            else:
-                try:
-                    await asyncio.wait_for(
-                        self._channel_ready.wait(),
-                        timeout=self._ready_timeout,
-                    )
-                except asyncio.TimeoutError as exc:
-                    if self._test_mode != TEST_MODE_IGNORE_READY:
-                        # Deliberately leave the socket open. Tearing it down and
-                        # opening a replacement every retry is what accumulates
-                        # sessions on the TV until it stops accepting new ones.
-                        # The listener stays live, so a late ms.channel.ready is
-                        # still picked up and the next call reuses this socket.
-                        raise ConnectionError(
-                            'TV Art WebSocket did not emit ms.channel.ready within '
-                            f'{self._ready_timeout:g}s'
-                        ) from exc
-                    self._response_logger.warning(
-                        'TEST MODE %d (%s): ms.channel.ready did not arrive '
-                        'within %gs; continuing anyway (socket=%s, channel_id=%s)',
-                        self._test_mode,
-                        describe_test_mode(self._test_mode),
-                        self._ready_timeout,
-                        self.socket_state,
-                        'present' if self._channel_id else 'missing',
-                    )
-                    # Downstream art requests refuse to run without this flag, so
-                    # set it to exercise the rest of the pipeline as if the TV had
-                    # completed the handshake.
-                    self._channel_ready.set()
+            except asyncio.TimeoutError as exc:
+                # Deliberately leave the socket open. Tearing it down and
+                # opening a replacement every retry is what accumulates
+                # sessions on the TV until it stops accepting new ones.
+                # The listener stays live, so a late ms.channel.ready is
+                # still picked up and the next call reuses this socket.
+                raise ArtChannelNotReadyError(
+                    'TV Art WebSocket did not emit ms.channel.ready within '
+                    f'{self._ready_timeout:g}s'
+                ) from exc
             if not self._channel_id:
-                if self._test_mode == TEST_MODE_IGNORE_READY:
-                    # Mirrors homebridge's `this.data.id || 'noop-id'` fallback so
-                    # requests are still emitted and their failure mode is visible.
-                    self._response_logger.warning(
-                        'TEST MODE %d (%s): no ms.channel.connect id; '
-                        'falling back to noop-id',
-                        self._test_mode,
-                        describe_test_mode(self._test_mode),
-                    )
-                    self._channel_id = 'noop-id'
-                else:
-                    await self.close()
-                    raise ConnectionError(
-                        'TV Art WebSocket did not provide a connection ID'
-                    )
+                await self.close()
+                raise ConnectionError(
+                    'TV Art WebSocket did not provide a connection ID'
+                )
         if started:
             try:
                 await self.get_artmode()
@@ -357,11 +269,6 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
         """True once ms.channel.ready has been observed for the live socket."""
         return self._channel_ready.is_set()
 
-    @property
-    def test_mode(self):
-        """Active SAMSUNG_TV_ART_TEST_MODE for this client."""
-        return self._test_mode
-
     async def close(self):
         self._suppress_disconnect_log = True
         try:
@@ -391,7 +298,7 @@ class _LoggingSamsungTVAsyncArt(SamsungTVAsyncArt):
                 or not self._channel_ready.is_set()
                 or not self._channel_id
             ):
-                raise ConnectionError('TV Art WebSocket channel is not ready')
+                raise ArtChannelNotReadyError('TV Art WebSocket channel is not ready')
 
             request_data = dict(request_data)
             request_id = request_data.get('request_id') or self.get_uuid()
@@ -627,6 +534,17 @@ class FrameTVConnection:
                 )
                 self._artmode_failures = 0
                 return str(status).lower() == 'on'
+            except ArtChannelNotReadyError as exc:
+                # A second attempt would wait the same ready timeout for the
+                # same event on the same socket, doubling the cost of every
+                # probe against a TV whose art-app channel never comes up.
+                last_error = exc
+                self._logger.debug(
+                    'get_artmode() attempt %d aborted, channel not ready: %s',
+                    attempt + 1,
+                    exc,
+                )
+                break
             except Exception as exc:
                 last_error = exc
                 self._logger.debug(
@@ -634,19 +552,6 @@ class FrameTVConnection:
                     attempt + 1,
                     exc,
                 )
-        if self._client.test_mode == TEST_MODE_IGNORE_READY:
-            # Homebridge tolerates a silent art channel because _send() resolves
-            # on bytes written and never awaits a reply. Mirror that tolerance so
-            # the rest of the pipeline keeps running, but keep the silence
-            # visible rather than reporting it as success.
-            self._logger.warning(
-                'TEST MODE %d (%s): no Art Mode response (%s); keeping the '
-                'socket open and reporting art_mode=False',
-                TEST_MODE_IGNORE_READY,
-                describe_test_mode(TEST_MODE_IGNORE_READY),
-                last_error,
-            )
-            return False
         self._artmode_failures += 1
         # Retiring on the first unanswered request threw away sockets that were
         # merely slow, and every replacement socket costs memory on the TV. Only

@@ -4,13 +4,6 @@ import time
 import unittest
 from unittest import mock
 
-from loop.tv_connection import (
-    TEST_MODE_HANG_ON_READY,
-    TEST_MODE_IGNORE_READY,
-    TEST_MODE_NORMAL,
-    describe_test_mode,
-    read_test_mode,
-)
 from loop.uploader import monitor_and_display
 
 
@@ -27,7 +20,6 @@ class ReconnectBackoffTests(unittest.IsolatedAsyncioTestCase):
         host._first_connect_failure_time = None
         host._status_check_needed = False
         host._in_art_mode = True
-        host.test_mode = TEST_MODE_NORMAL
         return host
 
     def attach_failing_tv(self, host, error=None):
@@ -363,51 +355,6 @@ class LivenessProbeLoopTests(unittest.IsolatedAsyncioTestCase):
         # it probed once.
         self.assertGreaterEqual(len(attempts), 2)
         host.log.debug.assert_called()
-
-
-class TestModeParsingTests(unittest.TestCase):
-    """SAMSUNG_TV_ART_TEST_MODE is diagnostic, so bad input must never break boot."""
-
-    def read(self, raw, logger=None):
-        env = {} if raw is None else {'SAMSUNG_TV_ART_TEST_MODE': raw}
-        with mock.patch.dict(os.environ, env, clear=False):
-            if raw is None:
-                os.environ.pop('SAMSUNG_TV_ART_TEST_MODE', None)
-            return read_test_mode(logger)
-
-    def test_default_is_normal(self):
-        self.assertEqual(self.read(None), TEST_MODE_NORMAL)
-
-    def test_supported_modes_round_trip(self):
-        self.assertEqual(self.read('0'), TEST_MODE_NORMAL)
-        self.assertEqual(self.read('1'), TEST_MODE_IGNORE_READY)
-        self.assertEqual(self.read('2'), TEST_MODE_HANG_ON_READY)
-
-    def test_legacy_hang_value_still_maps_to_hang_mode(self):
-        logger = mock.Mock()
-        self.assertEqual(self.read('3', logger), TEST_MODE_HANG_ON_READY)
-        logger.warning.assert_called_once()
-
-    def test_surrounding_whitespace_is_tolerated(self):
-        self.assertEqual(self.read('  1  '), TEST_MODE_IGNORE_READY)
-
-    def test_unknown_mode_falls_back_and_warns(self):
-        logger = mock.Mock()
-        self.assertEqual(self.read('7', logger), TEST_MODE_NORMAL)
-        logger.warning.assert_called_once()
-
-    def test_non_numeric_falls_back_and_warns(self):
-        logger = mock.Mock()
-        self.assertEqual(self.read('yes', logger), TEST_MODE_NORMAL)
-        logger.warning.assert_called_once()
-
-    def test_descriptions_exist_for_every_mode(self):
-        for mode in (
-            TEST_MODE_NORMAL,
-            TEST_MODE_IGNORE_READY,
-            TEST_MODE_HANG_ON_READY,
-        ):
-            self.assertNotEqual(describe_test_mode(mode), 'unknown')
 
 
 if __name__ == '__main__':

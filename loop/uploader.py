@@ -70,13 +70,7 @@ from .BingDailyWallpaperManager import (
 from .MuseumLabelManager import MuseumLabelManager
 from .mqtt_integration import MQTTIntegrationMixin, _MatteRejectedError
 from .pil_methods import PIL_methods
-from .tv_connection import (
-    FrameTVConnection,
-    TEST_MODE_HANG_ON_READY,
-    TEST_MODE_NORMAL,
-    describe_test_mode,
-    read_test_mode,
-)
+from .tv_connection import FrameTVConnection
 HAVE_PIL = False
 try:
     # Import Pillow submodules defensively. In some runtime environments a
@@ -168,8 +162,6 @@ class monitor_and_display(MQTTIntegrationMixin):
             5,
             int(os.environ.get('SAMSUNG_TV_ART_STATUS_PROBE_SECONDS', '15')),
         )
-        # Diagnostic only: controls how a missing ms.channel.ready is handled.
-        self.test_mode = read_test_mode(self.log)
         self._last_art_status_probe = 0
         self.update_time = int(max(0, update_time*60))   #convert minutes to seconds
         self.period = min(max(5, period), self.update_time) if self.update_time > 0 else period
@@ -409,13 +401,6 @@ class monitor_and_display(MQTTIntegrationMixin):
             self._loop = asyncio.get_running_loop()
         except Exception:
             self._loop = None
-        if self.test_mode != TEST_MODE_NORMAL:
-            self.log.warning(
-                'SAMSUNG_TV_ART_TEST_MODE=%d active: %s. This is a diagnostic '
-                'setting and must not be left enabled in normal operation.',
-                self.test_mode,
-                describe_test_mode(self.test_mode),
-            )
         # Create TV connection (may raise if TV offline)
         try:
             self._create_tv_connection()
@@ -561,11 +546,14 @@ class monitor_and_display(MQTTIntegrationMixin):
         """Record a handshake failure, log the real cause, and back off."""
         now = time.time()
         self._connect_failures += 1
-        # The com.samsung.art-app channel only completes its handshake while the
-        # TV is in Art Mode. On HDMI or live TV the socket opens but never emits
-        # ms.channel.ready, which is expected Samsung behaviour rather than a
-        # fault, so it must not be escalated or counted toward the watchdog.
-        expected = self._in_art_mode is not True
+        # This used to be `self._in_art_mode is not True`, which was circular:
+        # _in_art_mode is None precisely *because* the channel is down, so every
+        # genuine wedge classified itself as expected, stayed at INFO and reset
+        # the watchdog timer. A TV reset on HDMI proved ms.channel.ready does not
+        # require Art Mode — it completed the handshake and reported art_mode=off
+        # — so a missing ready is only "expected" when the TV actually told us
+        # Art Mode was off, not when we have no idea what state it is in.
+        expected = self._in_art_mode is False
         if expected:
             self._first_connect_failure_time = None
         elif self._first_connect_failure_time is None:
@@ -644,6 +632,21 @@ class monitor_and_display(MQTTIntegrationMixin):
                     # the TV is off, and it clears this flag as soon as power
                     # returns. Probing here would only duplicate that work.
                     continue
+                if (
+                    not self._art_channel_is_live()
+                    and time.time() < self._next_connect_attempt
+                ):
+                    # The channel is down and reconnect_tv would return without
+                    # touching a socket, so this probe can only re-run the REST
+                    # power check and report the same failure. Logging it at INFO
+                    # made an enforced cooldown look like a broken retry loop.
+                    self.log.debug(
+                        'Art liveness probe skipped: connect cooldown active '
+                        'for another %.0fs (socket=%s)',
+                        max(0.0, self._next_connect_attempt - time.time()),
+                        self._describe_socket_state(),
+                    )
+                    continue
                 self._log_art_liveness_probe()
                 previous = self._in_art_mode
                 started = time.monotonic()
@@ -702,6 +705,12 @@ class monitor_and_display(MQTTIntegrationMixin):
         """Replace a dropped Art client; never reopen the old WebSocket object."""
         self._status_check_needed = True
         if time.time() < self._next_connect_attempt:
+            self.log.debug(
+                'Art reconnect suppressed: connect cooldown active for another '
+                '%.0fs after %d failure(s)',
+                max(0.0, self._next_connect_attempt - time.time()),
+                self._connect_failures,
+            )
             return False
         old_tv = self.tv
         if old_tv is not None:
@@ -719,12 +728,7 @@ class monitor_and_display(MQTTIntegrationMixin):
                 self._reset_connect_backoff()
                 self.tv.retire()
                 return False
-            if self.test_mode == TEST_MODE_HANG_ON_READY:
-                # No outer timeout, so the stall is observable exactly as it is in
-                # homebridge-samsung-tizen rather than being cut short at 15s.
-                await self.tv.start_listening()
-            else:
-                await asyncio.wait_for(self.tv.start_listening(), timeout=15)
+            await asyncio.wait_for(self.tv.start_listening(), timeout=15)
             if self.tv.is_alive():
                 self._note_connect_success()
                 self.log.info('Connected to TV with a fresh WebSocket client')
@@ -732,9 +736,33 @@ class monitor_and_display(MQTTIntegrationMixin):
             self._note_connect_failure('WebSocket closed immediately after start')
         except Exception as e:
             self._note_connect_failure('{}: {}'.format(type(e).__name__, e))
-        if self.tv is not None:
+        if self.tv is not None and not self._replacement_socket_is_usable():
             self.tv.retire()
         return False
+
+    def _replacement_socket_is_usable(self):
+        """True when a failed handshake still left a socket worth keeping.
+
+        start_listening() deliberately keeps the transport open when
+        ms.channel.ready never arrives, so the live listener can still pick up a
+        late ready and the next Art request reuses this socket. Retiring here
+        threw that away and forced a brand new session on every cooldown
+        expiry, which is exactly the accumulation that wedges the TV. Let the
+        consecutive-failure threshold in query_artmode do the retiring instead.
+        """
+        tv = self.tv
+        if tv is None or tv.retired:
+            return False
+        try:
+            if not tv.is_alive():
+                return False
+        except Exception:
+            return False
+        self.log.debug(
+            'Keeping the open Art socket after a failed handshake; a late '
+            'ms.channel.ready can still complete it',
+        )
+        return True
 
     async def safe_in_artmode(self, allow_during_refresh=False):
         async with self._tv_state_lock:

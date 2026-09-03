@@ -25,7 +25,6 @@ class QueryArtmodeFailureThresholdTests(unittest.TestCase):
         conn._artmode_failures = 0
         conn._artmode_failure_limit = limit
         conn._client = mock.Mock()
-        conn._client.test_mode = 0
         conn._client.get_artmode = mock.AsyncMock(return_value=status)
         conn.retire = mock.Mock()
         return conn

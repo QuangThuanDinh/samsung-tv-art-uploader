@@ -24,7 +24,6 @@ class LoggingSamsungTVAsyncArtTests(unittest.IsolatedAsyncioTestCase):
         client._disconnect_callback = None
         client._ready_timeout = 1.0
         client._request_timeout = 1.0
-        client._test_mode = 0
         client._recv_loop = mock.Mock(done=mock.Mock(return_value=False))
         client._active_listener = client._recv_loop
         client.is_alive = mock.Mock(return_value=True)
