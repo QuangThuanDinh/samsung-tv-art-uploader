@@ -858,7 +858,10 @@ class MQTTIntegrationMixin:
         if self._matte_options_cache is not None:
             return
         try:
-            mattes = await self.tv.get_matte_list(True)
+            async with self.tv_session('matte options', require_artmode=False) as ready:
+                if not ready:
+                    raise RuntimeError('TV is not available')
+                mattes = await self.tv.get_matte_list(True)
             if isinstance(mattes, (list, tuple)) and len(mattes) >= 2:
                 types = [m.get('matte_type') for m in mattes[0] if isinstance(m, dict) and m.get('matte_type')]
                 colors = [m.get('color') for m in mattes[1] if isinstance(m, dict) and m.get('color')]
@@ -1096,6 +1099,31 @@ class MQTTIntegrationMixin:
             self.log.warning('MQTT slideshow available publish failed: %s', e)
 
     async def _apply_slideshow_override(
+        self,
+        paths,
+        req_id=None,
+        new_collections=None,
+        max_uploads=None,
+        force_reupload=False,
+        ack_cmd='slideshow/override/set',
+    ):
+        """Scope a slideshow apply to a single Art session, then run it."""
+        async with self.tv_session('slideshow apply', require_artmode=False) as ready:
+            if not ready:
+                self._publish_ack(
+                    ack_cmd, 'error', 'TV is not available right now', req_id,
+                )
+                return
+            return await self._apply_slideshow_override_in_session(
+                paths,
+                req_id=req_id,
+                new_collections=new_collections,
+                max_uploads=max_uploads,
+                force_reupload=force_reupload,
+                ack_cmd=ack_cmd,
+            )
+
+    async def _apply_slideshow_override_in_session(
         self,
         paths,
         req_id=None,
@@ -1423,6 +1451,10 @@ class MQTTIntegrationMixin:
                 ack('error', 'Another upload or refresh is already running')
                 return
             self._refresh_in_progress = True
+        async with self.tv_session('single upload', require_artmode=False):
+            await self._upload_single_image_in_session(path, ack)
+
+    async def _upload_single_image_in_session(self, path, ack):
         try:
             if self.tv is None or not await self.safe_in_artmode(
                 allow_during_refresh=True
@@ -2559,17 +2591,27 @@ class MQTTIntegrationMixin:
             self._refresh_in_progress = True
         self._publish_slideshow_state()
         try:
-            await upload_coro
-            # Select the just-uploaded image
-            record = self.uploaded_files.get(rel_path)
-            content_id = record.get('content_id') if record else None
-            if content_id:
-                await self.tv.select_image(content_id)
-                self.current_content_id = content_id
-                await self.update_ha_selected_artwork(content_id)
-                self._publish_ack('artwork/set', 'ok', f'Selected {os.path.basename(rel_path)}', req_id)
-            else:
-                self._publish_ack('artwork/set', 'error', f'Upload failed for {os.path.basename(rel_path)}', req_id)
+            async with self.tv_session('artwork set') as ready:
+                if not ready:
+                    self._publish_ack(
+                        'artwork/set',
+                        'error',
+                        'TV is not in Art Mode; nothing was uploaded',
+                        req_id,
+                    )
+                    upload_coro.close()
+                    return
+                await upload_coro
+                # Select the just-uploaded image
+                record = self.uploaded_files.get(rel_path)
+                content_id = record.get('content_id') if record else None
+                if content_id:
+                    await self.tv.select_image(content_id)
+                    self.current_content_id = content_id
+                    await self.update_ha_selected_artwork(content_id)
+                    self._publish_ack('artwork/set', 'ok', f'Selected {os.path.basename(rel_path)}', req_id)
+                else:
+                    self._publish_ack('artwork/set', 'error', f'Upload failed for {os.path.basename(rel_path)}', req_id)
         except Exception as e:
             self._publish_ack('artwork/set', 'error', f'Exception selecting: {e}', req_id)
         finally:

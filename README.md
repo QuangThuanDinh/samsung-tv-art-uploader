@@ -321,6 +321,7 @@ Key variables:
 |---|---|---|
 | `SAMSUNG_TV_ART_TV_IP` | _(required)_ | IP address of the Frame TV |
 | `SAMSUNG_TV_ART_PORT` | `8001` | Art WebSocket port. Port 8001 uses plain WS without token pairing; set 8002 only when required by the TV firmware |
+| `SAMSUNG_TV_ART_SAFE_MODE` | `false` | Open the Art WebSocket only for the duration of a flow (rotation, upload, apply, daily sync, matte apply) and close it immediately afterwards, instead of holding one open continuously. Each flow keeps a single socket for all of its steps — check Art Mode, list, upload, select, delete — and nested flows reuse it. Art Mode is resolved only at the start of a flow; between flows only the REST power probe runs. Implies the Art liveness probe and the connect watchdog are disabled. Use this when a TV wedges its Art service after accumulating WebSocket sessions |
 | `SAMSUNG_TV_ART_READY_TIMEOUT_SECONDS` | `10` | Seconds to wait for `ms.channel.ready` before replacing the Art connection |
 | `SAMSUNG_TV_ART_REQUEST_TIMEOUT_SECONDS` | `8` | Seconds to wait for an Art request response. Previously fixed at 2s, which timed out on a healthy but busy TV |
 | `SAMSUNG_TV_ART_REQUEST_FAILURE_LIMIT` | `3` | Consecutive unanswered `get_artmode_status` requests before the socket is retired. Each replacement socket consumes memory on the TV, so slow replies no longer trigger one |

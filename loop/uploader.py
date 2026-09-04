@@ -50,6 +50,7 @@ Example:
 
 import logging
 import os
+import contextlib
 import socket
 import uuid
 import io
@@ -119,6 +120,11 @@ def parseargs():
 class monitor_and_display(MQTTIntegrationMixin):
     
     allowed_ext = ['jpg', 'jpeg', 'png', 'bmp', 'tif']
+
+    # Defaults so the SAFE MODE helpers behave as plain pass-throughs even
+    # before __init__ has run.
+    safe_mode = False
+    _tv_session_depth = 0
     
     def __init__(self, ip, folder, period=5, update_time=1440, include_fav=False, sync=True, matte='none', sequential=False, on=False, token_file=None, exclude=[], exclude_content_ids=[]):
         self.log = logging.getLogger('Main.'+__class__.__name__)
@@ -162,6 +168,23 @@ class monitor_and_display(MQTTIntegrationMixin):
             5,
             int(os.environ.get('SAMSUNG_TV_ART_STATUS_PROBE_SECONDS', '15')),
         )
+        # SAFE MODE: hold no Art WebSocket between jobs. A socket is opened when
+        # a flow needs one and closed as soon as that flow ends, so the TV never
+        # has to keep a session alive for us. REST power probing continues, but
+        # Art Mode is only ever resolved inside a flow because the art-app
+        # channel cannot be reached without a socket.
+        self.safe_mode = str(
+            os.environ.get('SAMSUNG_TV_ART_SAFE_MODE', 'false')
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
+        # Flows nest: an override apply calls upload_files, which selects and
+        # deletes. Only the outermost scope opens and closes the socket.
+        self._tv_session_depth = 0
+        if self.safe_mode:
+            self.log.info(
+                'SAFE MODE enabled: the Art WebSocket is opened per flow and '
+                'closed afterwards; the liveness probe and connect watchdog '
+                'are disabled'
+            )
         self._last_art_status_probe = 0
         self.update_time = int(max(0, update_time*60))   #convert minutes to seconds
         self.period = min(max(5, period), self.update_time) if self.update_time > 0 else period
@@ -596,6 +619,10 @@ class monitor_and_display(MQTTIntegrationMixin):
         """Exit when the Art channel stays unusable while the TV answers REST."""
         if self.connect_watchdog_seconds <= 0:
             return
+        if self.safe_mode:
+            # Restarting cannot help: SAFE MODE holds no socket to go stale, and
+            # a wedged art channel is state on the TV that survives our process.
+            return
         if self._first_connect_failure_time is None:
             return
         stuck_seconds = now - self._first_connect_failure_time
@@ -764,6 +791,105 @@ class monitor_and_display(MQTTIntegrationMixin):
         )
         return True
 
+    @contextlib.asynccontextmanager
+    async def tv_session(self, label, require_artmode=True):
+        """Scope one unit of TV work to a single Art WebSocket.
+
+        Outside SAFE MODE this is transparent: the persistent connection is
+        used and never closed here, so behaviour is unchanged.
+
+        In SAFE MODE the outermost scope opens a socket, waits for
+        ms.channel.ready and closes it again on exit. Nested scopes reuse it, so
+        a flow like "check art mode, list images, upload, select, delete old"
+        costs exactly one session rather than one per step.
+
+        Yields True when the TV is ready for work. Callers must check it:
+
+            async with self.tv_session('rotate') as ready:
+                if not ready:
+                    return
+        """
+        if not self.safe_mode:
+            yield True
+            return
+        if self._tv_session_depth > 0:
+            self._tv_session_depth += 1
+            try:
+                yield True
+            finally:
+                self._tv_session_depth -= 1
+            return
+        ready = False
+        try:
+            ready = await self._open_tv_session(label, require_artmode)
+            self._tv_session_depth = 1
+            yield ready
+        finally:
+            self._tv_session_depth = 0
+            await self._close_tv_session(label)
+
+    async def _open_tv_session(self, label, require_artmode):
+        """Open a socket for one flow, or report that the TV cannot serve it."""
+        # REST first: a powered-off TV must never cost a WebSocket attempt.
+        try:
+            if self.tv is None:
+                self._create_tv_connection()
+            if not await self.tv.is_powered_on():
+                self._tv_powered_on = False
+                self._in_art_mode = False
+                self.log.info(
+                    'SAFE MODE: skipping %s, the TV is powered off', label,
+                )
+                return False
+        except Exception as e:
+            self.log.warning(
+                'SAFE MODE: skipping %s, TV power probe failed: %s', label, e,
+            )
+            return False
+        self._tv_powered_on = True
+        if self.tv is None or self.tv.retired or not self.tv.is_alive():
+            # reconnect_tv retires the outgoing client and honours the connect
+            # cooldown, so a wedged art channel is not hammered per flow.
+            if not await self.reconnect_tv(power_verified=True):
+                self.log.info(
+                    'SAFE MODE: skipping %s, no Art channel available', label,
+                )
+                return False
+        if not require_artmode:
+            self.log.debug('SAFE MODE: session open for %s', label)
+            return True
+        try:
+            in_artmode = await self.tv.query_artmode(power_verified=True)
+        except Exception as e:
+            self.log.info(
+                'SAFE MODE: skipping %s, Art Mode check failed: %s', label, e,
+            )
+            return False
+        self._in_art_mode = bool(in_artmode)
+        if not in_artmode:
+            self.log.info(
+                'SAFE MODE: skipping %s, the TV is not in Art Mode', label,
+            )
+            return False
+        self.log.info('SAFE MODE: session open for %s', label)
+        return True
+
+    async def _close_tv_session(self, label):
+        """Drop the socket so the TV keeps no session on our behalf."""
+        tv = self.tv
+        if tv is None or tv.retired:
+            return
+        # Keep self.tv pointing at the retired object rather than clearing it:
+        # a stray call outside a session then fails the same way it would after
+        # any other retirement, instead of raising AttributeError on None.
+        try:
+            tv.retire()
+            await tv.close()
+        except Exception as e:
+            self.log.debug('SAFE MODE: error closing session for %s: %s', label, e)
+        else:
+            self.log.info('SAFE MODE: session closed for %s', label)
+
     async def safe_in_artmode(self, allow_during_refresh=False):
         async with self._tv_state_lock:
             return await self._safe_in_artmode_unlocked(allow_during_refresh)
@@ -820,6 +946,16 @@ class monitor_and_display(MQTTIntegrationMixin):
                 self._tv_shutdown_signaled = False
             self._tv_off_confirmed = False
             self._tv_powered_on = True
+
+            if self.safe_mode and self._tv_session_depth == 0:
+                # SAFE MODE resolves Art Mode only inside a flow, because doing
+                # it here would open a socket purely to answer a background
+                # question. REST has already confirmed power, which is all the
+                # main loop needs to decide whether to start a flow at all; the
+                # flow itself verifies Art Mode and skips if the TV is not in it.
+                self._status_check_needed = False
+                self.consecutive_failures = 0
+                return True
 
             if self.tv.retired or not self.tv.is_alive():
                 if not await self.reconnect_tv(power_verified=True):
@@ -1338,27 +1474,28 @@ class monitor_and_display(MQTTIntegrationMixin):
             pass
         self.load_program_data()
         self.log.info('files in directory: {}: {}'.format(self.folder, self.get_folder_files()))
-        await self._initialize_tv_state()
-        
-        # Display art immediately after init only if TV is already in art mode.
-        # If not, the main loop will pick it up when art mode is detected naturally.
-        if len(self.get_content_ids()) > 0:
-            if await self.safe_in_artmode():
-                self.log.info('Content available after init and TV is in art mode, displaying first artwork')
-                await self.change_art()
-                self.start = time.time()
-                self.write_program_data()
-            else:
-                self.log.info('Content available after init but TV is not in art mode; waiting for art mode')
-        # Initialization complete — clear startup lock and let UI know it's safe
-        self._startup_in_progress = False
-        self._publish_slideshow_state()
-        # Force-publish current artwork state so UIs clear any stale in_art_mode=false
-        # retained from a previous session.
-        try:
-            await self._publish_current_artwork_state(force=True)
-        except Exception:
-            pass
+        async with self.tv_session('startup', require_artmode=False):
+            await self._initialize_tv_state()
+
+            # Display art immediately after init only if TV is already in art mode.
+            # If not, the main loop will pick it up when art mode is detected naturally.
+            if len(self.get_content_ids()) > 0:
+                if await self.safe_in_artmode():
+                    self.log.info('Content available after init and TV is in art mode, displaying first artwork')
+                    await self.change_art()
+                    self.start = time.time()
+                    self.write_program_data()
+                else:
+                    self.log.info('Content available after init but TV is not in art mode; waiting for art mode')
+            # Initialization complete — clear startup lock and let UI know it's safe
+            self._startup_in_progress = False
+            self._publish_slideshow_state()
+            # Force-publish current artwork state so UIs clear any stale in_art_mode=false
+            # retained from a previous session.
+            try:
+                await self._publish_current_artwork_state(force=True)
+            except Exception:
+                pass
         
     async def get_tv_content(self, category='MY-C0002'):
         '''
@@ -2097,11 +2234,14 @@ class monitor_and_display(MQTTIntegrationMixin):
                 self.log.info('doing slideshow update, after {}'.format(self.get_time(self.update_time)))
                 self.start = time.time()
                 self.write_program_data()
-                if self.include_fav:
-                    self.log.info('updating favourites')
-                    fav = await self.get_tv_content('MY-C0004')
-                    self.fav = set(fav) if fav is not None else self.fav
-                await self.change_art()
+                async with self.tv_session('slideshow update') as ready:
+                    if not ready:
+                        return
+                    if self.include_fav:
+                        self.log.info('updating favourites')
+                        fav = await self.get_tv_content('MY-C0004')
+                        self.fav = set(fav) if fav is not None else self.fav
+                    await self.change_art()
             else:
                 self.log.info('next {} update in {}'.format('sequential' if self.sequential else 'random', self.get_time(self.update_time - (time.time() - self.start))))
                 
@@ -2299,14 +2439,24 @@ class monitor_and_display(MQTTIntegrationMixin):
             # The displayed matte will be whatever was baked when the image
             # was last uploaded. A changed matte becomes visible when the
             # slideshow Apply workflow detects the mismatch and reseeds.
-            await self.tv.select_image(content_id)
-            self.shown_content_ids.add(content_id)  # Mark as shown
-            self.current_content_id = content_id
-            await self.update_ha_selected_artwork(content_id)
+            async with self.tv_session('art rotation') as ready:
+                if not ready:
+                    return
+                await self.tv.select_image(content_id)
+                self.shown_content_ids.add(content_id)  # Mark as shown
+                self.current_content_id = content_id
+                await self.update_ha_selected_artwork(content_id)
         else:
             self.log.info('skipping art update, as new content_id: %s is the same', content_id)
 
     async def _apply_matte_via_reupload(self, path):
+        '''Scope the matte re-upload flow to a single Art session.'''
+        async with self.tv_session('matte apply') as ready:
+            if not ready:
+                raise RuntimeError('TV is not in art mode')
+            return await self._apply_matte_via_reupload_in_session(path)
+
+    async def _apply_matte_via_reupload_in_session(self, path):
         '''Make a per-image matte override visible by uploading a replacement,
         selecting it when necessary, and then deleting the old content ID. This
         is the only path that actually produces a visible matte change on this
@@ -2477,7 +2627,8 @@ class monitor_and_display(MQTTIntegrationMixin):
         except Exception as e:
             self.log.warning('error in check_dir, attempting reconnect: %s', e)
             self._status_check_needed = True
-            await self.reconnect_tv()
+            if not (self.safe_mode and self._tv_session_depth == 0):
+                await self.reconnect_tv()
 
     async def select_artwork(self):
         '''
@@ -2487,7 +2638,9 @@ class monitor_and_display(MQTTIntegrationMixin):
         await self.initialize()
         self._status_check_needed = True
         probe_task = None
-        if self.art_status_probe_seconds > 0:
+        if self.art_status_probe_seconds > 0 and not self.safe_mode:
+            # In SAFE MODE there is no persistent socket to prove alive, and
+            # probing would open one purely to close it again.
             probe_task = asyncio.create_task(self._art_liveness_loop())
         try:
             await self._select_artwork_loop()
@@ -2508,9 +2661,19 @@ class monitor_and_display(MQTTIntegrationMixin):
             await self.bing_daily.tick()
 
             # Startup may have happened while the Art channel was unreachable, so
-            # finish the TV-dependent initialization as soon as one is live.
-            if self._tv_init_pending and self._art_channel_is_live():
-                await self._initialize_tv_state()
+            # finish the TV-dependent initialization as soon as one is live. In
+            # SAFE MODE no socket is held between flows, so open one for this.
+            if self._tv_init_pending and (
+                self.safe_mode or self._art_channel_is_live()
+            ):
+                if self.safe_mode:
+                    async with self.tv_session(
+                        'deferred init', require_artmode=False,
+                    ) as ready:
+                        if ready:
+                            await self._initialize_tv_state()
+                else:
+                    await self._initialize_tv_state()
 
             # The liveness probe now runs on its own task so its interval is
             # independent of this loop's period and of the current art mode.
@@ -2588,9 +2751,11 @@ class monitor_and_display(MQTTIntegrationMixin):
                 continue
             self._not_in_artmode_logged = False
             await self.check_dir()
-            # Periodically republish current artwork state to keep MQTT fresh
+            # Periodically republish current artwork state to keep MQTT fresh.
+            # SAFE MODE publishes at the end of each flow instead, because
+            # polling here would open a socket purely to read one value.
             try:
-                if self.state_refresh_seconds > 0:
+                if self.state_refresh_seconds > 0 and not self.safe_mode:
                     now = time.time()
                     if now - self._last_state_publish >= self.state_refresh_seconds:
                         await self._publish_current_artwork_state(force=False)
@@ -2663,6 +2828,23 @@ class monitor_and_display(MQTTIntegrationMixin):
             pass
 
     async def _do_full_reseed(self, req_id=None, skip_started_ack=False):
+        """Scope a full reseed to one Art session, then run it."""
+        if req_id is None:
+            req_id = f'auto_{int(time.time() * 1000)}'
+        async with self.tv_session('full reseed') as ready:
+            if not ready:
+                self._publish_ack(
+                    'collections/refresh',
+                    'error',
+                    'TV is not available for a refresh right now',
+                    req_id,
+                )
+                return
+            return await self._do_full_reseed_in_session(
+                req_id=req_id, skip_started_ack=skip_started_ack,
+            )
+
+    async def _do_full_reseed_in_session(self, req_id=None, skip_started_ack=False):
         """Delete TV uploads, upload a fresh randomized set, then display the first.
         Shared by the Refresh button, collection selection changes, and Update & Refresh.
         Always publishes MQTT ack progress messages so both UIs show progress for any
