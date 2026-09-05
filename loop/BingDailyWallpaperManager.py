@@ -165,13 +165,28 @@ class BingDailyWallpaperManager:
             return
         if not os.path.isfile(os.path.join(self.host.media_root, path)):
             return
-        if not self.is_daily_mode() or self.host.slideshow_override == [path]:
+        if not self.is_daily_mode():
             return
-        self.log.info(
-            'Daily mode selection is stale (%s); selecting %s',
-            self.host.slideshow_override,
-            path,
-        )
+        if self.host.slideshow_override == [path]:
+            # The selection already names today's image, but that only means the
+            # intent was recorded - not that the TV ever received it. An apply
+            # that failed after clearing slideshow_override_pending would
+            # otherwise leave the selection looking correct forever while the TV
+            # kept showing yesterday's picture, because nothing re-marks it.
+            # Re-check what is actually uploaded so daily mode self-corrects.
+            if not self.host._slideshow_paths_requiring_upload([path]):
+                return
+            self.log.info(
+                'Daily mode selection names %s but the TV does not hold it; '
+                're-queuing the upload',
+                path,
+            )
+        else:
+            self.log.info(
+                'Daily mode selection is stale (%s); selecting %s',
+                self.host.slideshow_override,
+                path,
+            )
         self._mark_sync_pending(
             path,
             force_reupload=self._requires_full_replace(path),

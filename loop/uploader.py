@@ -855,18 +855,28 @@ class monitor_and_display(MQTTIntegrationMixin):
                     'SAFE MODE: skipping %s, no Art channel available', label,
                 )
                 return False
-        if not require_artmode:
-            self.log.debug('SAFE MODE: session open for %s', label)
-            return True
+        # Resolve Art Mode on the socket we just opened even when the flow does
+        # not require it. It is one request on an already-open connection, and
+        # it is the only thing that keeps _in_art_mode (and therefore the MQTT
+        # state the UIs render) honest, because SAFE MODE never probes between
+        # flows.
         try:
             in_artmode = await self.tv.query_artmode(power_verified=True)
         except Exception as e:
-            self.log.info(
-                'SAFE MODE: skipping %s, Art Mode check failed: %s', label, e,
+            if require_artmode:
+                self.log.info(
+                    'SAFE MODE: skipping %s, Art Mode check failed: %s',
+                    label,
+                    e,
+                )
+                return False
+            self.log.debug(
+                'SAFE MODE: Art Mode unknown for %s: %s', label, e,
             )
-            return False
+            self.log.info('SAFE MODE: session open for %s', label)
+            return True
         self._in_art_mode = bool(in_artmode)
-        if not in_artmode:
+        if not in_artmode and require_artmode:
             self.log.info(
                 'SAFE MODE: skipping %s, the TV is not in Art Mode', label,
             )
@@ -950,10 +960,19 @@ class monitor_and_display(MQTTIntegrationMixin):
             if self.safe_mode and self._tv_session_depth == 0:
                 # SAFE MODE resolves Art Mode only inside a flow, because doing
                 # it here would open a socket purely to answer a background
-                # question. REST has already confirmed power, which is all the
-                # main loop needs to decide whether to start a flow at all; the
-                # flow itself verifies Art Mode and skips if the TV is not in it.
-                self._status_check_needed = False
+                # question. REST power is the answer the caller gets: it is what
+                # decides whether starting a flow is worth a socket at all, and
+                # the flow itself verifies Art Mode and skips if the TV is not
+                # in it.
+                #
+                # _in_art_mode is deliberately left untouched so MQTT keeps
+                # reporting whatever the last flow actually observed rather than
+                # a guess. That makes it unusable as a loop gate, so keep
+                # _status_check_needed set: the main loop must keep calling this
+                # REST check instead of falling through to a stale or unknown
+                # _in_art_mode, which would send it into the not-in-art-mode
+                # backoff and stop check_dir() from ever running.
+                self._status_check_needed = True
                 self.consecutive_failures = 0
                 return True
 

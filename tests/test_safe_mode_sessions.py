@@ -118,15 +118,19 @@ class SafeModeSessionTests(unittest.TestCase):
         self.assertTrue(host.tv.retired)
         self.assertIs(host._in_art_mode, False)
 
-    def test_require_artmode_false_skips_the_artmode_query(self):
+    def test_require_artmode_false_still_records_art_mode(self):
         host = make_host(in_artmode=False)
 
         async def scenario():
             async with host.tv_session('flow', require_artmode=False) as ready:
+                # The flow runs even though the TV is not in Art Mode...
                 self.assertTrue(ready)
 
         run(scenario())
-        host.tv.query_artmode.assert_not_awaited()
+        # ...but the observed Art Mode is still recorded, because SAFE MODE
+        # never probes between flows and MQTT would otherwise go stale.
+        host.tv.query_artmode.assert_awaited()
+        self.assertIs(host._in_art_mode, False)
 
     def test_failed_handshake_yields_false(self):
         host = make_host(connects=False)
@@ -175,6 +179,8 @@ class SafeModeBackgroundWorkTests(unittest.TestCase):
         host._tv_off_confirmed = False
         host._refresh_in_progress = False
         host.consecutive_failures = 3
+        host._status_check_needed = False
+        host._in_art_mode = True
 
         result = run(host._safe_in_artmode_unlocked())
 
@@ -182,6 +188,102 @@ class SafeModeBackgroundWorkTests(unittest.TestCase):
         host.tv.query_artmode.assert_not_awaited()
         host.reconnect_tv.assert_not_awaited()
         self.assertEqual(host.consecutive_failures, 0)
+        # The REST answer must not masquerade as an Art Mode observation, and
+        # the caller must be told to keep asking. Clearing this flag let the
+        # main loop fall through to a stale or unknown _in_art_mode, take the
+        # not-in-art-mode backoff, and never run check_dir() -- which is the
+        # only place a pending Bing daily upload is applied.
+        self.assertTrue(host._status_check_needed)
+        self.assertIs(host._in_art_mode, True)
+
+    def test_rest_only_check_does_not_invent_an_art_mode(self):
+        host = make_host()
+        host._tv_shutdown_signaled = False
+        host._tv_off_confirmed = False
+        host._refresh_in_progress = False
+        host.consecutive_failures = 0
+        host._in_art_mode = None
+
+        self.assertTrue(run(host._safe_in_artmode_unlocked()))
+
+        self.assertIsNone(host._in_art_mode)
+        self.assertTrue(host._status_check_needed)
+
+
+class _StopLoop(Exception):
+    pass
+
+
+class SafeModeMainLoopTests(unittest.TestCase):
+    """The loop must keep reaching check_dir() on every pass in SAFE MODE.
+
+    check_dir() is the only place a pending Bing daily override is applied, so
+    a gate that resolves to False on any pass strands the TV on yesterday's
+    image until the process restarts.
+    """
+
+    def make_loop_host(self, passes=3):
+        host = make_host()
+        host.safe_mode = True
+        host._refresh_in_progress = False
+        host._tv_init_pending = False
+        host._tv_shutdown_signaled = False
+        host._tv_off_confirmed = False
+        host._not_in_artmode_logged = False
+        host._status_check_needed = True
+        host._in_art_mode = None
+        host.consecutive_failures = 0
+        host.state_refresh_seconds = 0
+        host.period = 1
+        host._artmode_event = asyncio.Event()
+        host._tv_state_lock = asyncio.Lock()
+        host.bing_daily = mock.Mock()
+        host.bing_daily.tick = mock.AsyncMock()
+        host.get_backoff_delay = mock.Mock(return_value=0)
+        host.mqtt_enabled = False
+        host._mqtt = None
+        host._reset_connect_backoff = mock.Mock()
+
+        host.check_dir_calls = 0
+
+        async def check_dir():
+            host.check_dir_calls += 1
+            if host.check_dir_calls >= passes:
+                raise _StopLoop
+        host.check_dir = mock.AsyncMock(side_effect=check_dir)
+        return host
+
+    def test_check_dir_runs_on_every_pass(self):
+        host = self.make_loop_host(passes=3)
+
+        async def scenario():
+            with self.assertRaises(_StopLoop):
+                await host._select_artwork_loop()
+
+        run(scenario())
+        self.assertEqual(host.check_dir_calls, 3)
+        # Every pass must be answered by the cheap REST probe, never by an
+        # Art Mode query that would cost a socket.
+        host.reconnect_tv.assert_not_awaited()
+        host.tv.query_artmode.assert_not_awaited()
+
+    def test_powered_off_tv_still_stops_the_loop_doing_work(self):
+        host = self.make_loop_host(passes=1)
+        host.tv.is_powered_on = mock.AsyncMock(return_value=False)
+
+        async def scenario():
+            task = asyncio.ensure_future(host._select_artwork_loop())
+            for _ in range(20):
+                await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        run(scenario())
+        self.assertEqual(host.check_dir_calls, 0)
+        self.assertIs(host._tv_powered_on, False)
 
 
 if __name__ == '__main__':

@@ -65,7 +65,11 @@ class _Host:
         pass
 
     def _slideshow_paths_requiring_upload(self, paths):
-        return []
+        uploaded = {
+            record.get('path_rel', key)
+            for key, record in self.uploaded_files.items()
+        }
+        return [path for path in paths if path not in uploaded]
 
     def get_selected_folder(self):
         return os.path.join(self.media_root, self.selected_collections[0])
@@ -584,6 +588,31 @@ class BingDailyWallpaperManagerTests(unittest.TestCase):
 
         self.assertEqual(self.host.slideshow_override, [path])
         self.assertFalse(self.host.slideshow_override_pending)
+
+    def test_selection_is_requeued_when_the_tv_never_got_the_image(self):
+        # An apply that failed after clearing slideshow_override_pending leaves
+        # the selection naming today's image while the TV still shows
+        # yesterday's. Nothing re-marks it, so daily mode has to notice that the
+        # named image is not actually uploaded and queue it again.
+        path = self._write_media(f'{BING_COLLECTION_ID}/OHR.Today_UHD.jpg')
+        self.host.selected_collections = [BING_COLLECTION_ID]
+        self.host.slideshow_override = [path]
+        self.host.slideshow_override_pending = False
+        # The TV holds yesterday's image, not the one the selection names.
+        yesterday = f'{BING_COLLECTION_ID}/OHR.Yesterday_UHD.jpg'
+        self.host.uploaded_files = {
+            yesterday: {'path_rel': yesterday, 'content_id': '1'}
+        }
+
+        with mock.patch.object(
+            self.manager,
+            'ensure_today',
+            return_value=self._daily_result(path),
+        ):
+            asyncio.run(self.manager.tick())
+
+        self.assertEqual(self.host.slideshow_override, [path])
+        self.assertTrue(self.host.slideshow_override_pending)
 
     def test_selection_is_untouched_outside_daily_mode(self):
         path = self._write_media(f'{BING_COLLECTION_ID}/OHR.Today_UHD.jpg')
