@@ -24,8 +24,24 @@ class PIL_methods:
     def __init__(self, mon):
         self.log = logging.getLogger('Main.'+__class__.__name__)
         self.mon = mon
-        self.uploaded_files = self.mon.uploaded_files
-        
+
+    def _known_basenames(self):
+        """Basenames already resolved to a content_id via the persisted cache.
+
+        uploaded_files keys are the media_root-relative path (path_rel) for
+        subfolder collections (e.g. "Bing_DailyWallpaper/foo.jpg"), while the
+        local files checked here are bare basenames from the current
+        collection folder. Comparing raw keys against bare filenames always
+        missed for subfolder collections, so every restart looked like every
+        file was unresolved and re-ran the full thumbnail download/compare
+        against the TV even when the cache already had the answer.
+        """
+        known = set()
+        for key, record in self.mon.uploaded_files.items():
+            path_rel = record.get('path_rel') or key
+            known.add(os.path.basename(path_rel))
+        return known
+
     async def initialize(self):
         '''
         initialize uploaded_files using PIL
@@ -34,24 +50,39 @@ class PIL_methods:
         '''
         if not HAVE_PIL:
             return True
-        self.log.info('Checking uploaded files list using PIL')
         files_images = self.load_files()
-        if files_images:
-            self.log.info('getting My Photos list')
-            my_photos = await self.mon.get_tv_content('MY-C0002')
-            if my_photos is None:
-                # None means the request failed. Reporting that as "no photos"
-                # states a fact we never established and hides a dead channel.
-                self.log.warning(
-                    'could not read My Photos from TV; skipping thumbnail sync'
-                )
-                return False
-            if my_photos:
-                await self.check_thumbnails(files_images, my_photos)
-            else:
-                self.log.info('no photos found on tv')
-        else:
+        if not files_images:
             self.log.info('no files, using origional uploaded files list')
+            return True
+        known = self._known_basenames()
+        unresolved = {
+            filename: data
+            for filename, data in files_images.items()
+            if filename not in known
+        }
+        if not unresolved:
+            self.log.info(
+                'All %d local file(s) already resolved via the persisted cache; '
+                'skipping PIL thumbnail sync', len(files_images),
+            )
+            return True
+        self.log.info(
+            'Checking %d of %d local file(s) not yet resolved via cache using PIL',
+            len(unresolved), len(files_images),
+        )
+        self.log.info('getting My Photos list')
+        my_photos = await self.mon.get_tv_content('MY-C0002')
+        if my_photos is None:
+            # None means the request failed. Reporting that as "no photos"
+            # states a fact we never established and hides a dead channel.
+            self.log.warning(
+                'could not read My Photos from TV; skipping thumbnail sync'
+            )
+            return False
+        if my_photos:
+            await self.check_thumbnails(unresolved, my_photos)
+        else:
+            self.log.info('no photos found on tv')
         return True
             
     async def check_thumbnails(self, files_images, my_photos):
@@ -70,7 +101,8 @@ class PIL_methods:
             
     def compare_thumbnails(self, files_images, my_photos_thumbnails):
         '''
-        compare file data with thumbnails to find a match, and update update_uploaded_files
+        compare file data with thumbnails to find a match, and update update_uploaded_files.
+        files_images only contains files not already resolved via the cache.
         '''
         for k, (filename, file_data) in enumerate(files_images.items()):
             for i, (my_content_id, my_data) in enumerate(my_photos_thumbnails.items()):
@@ -78,8 +110,7 @@ class PIL_methods:
                 self.log.debug('checking: {} against {}, thumbnail: {} bytes'.format(filename, my_content_id, len(my_data)))
                 if self.are_images_equal(Image.open(io.BytesIO(my_data)), file_data):
                     self.log.info('found uploaded file: {} as {}'.format(filename, my_content_id))
-                    if filename not in self.uploaded_files.keys():
-                        self.mon.update_uploaded_files(filename, my_content_id)
+                    self.mon.update_uploaded_files(filename, my_content_id)
                     break
         
     def log_progress(self, total, count):

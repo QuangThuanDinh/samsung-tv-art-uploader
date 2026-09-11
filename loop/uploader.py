@@ -207,7 +207,14 @@ class monitor_and_display(MQTTIntegrationMixin):
         self.exclude_content_ids = exclude_content_ids
         # Autosave token to file
         self.token_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), token_file) if token_file else token_file
-        self.program_data_path = './uploaded_files.json'
+        # Secondary debug/audit dump of uploaded_files (last_update + full
+        # mapping). The actual state restored on startup comes from
+        # cache_path (self.cache), which was already on /data — this file was
+        # never read back in, but it still deserves to survive container
+        # recreates rather than silently living under the ephemeral /app.
+        self.program_data_path = os.environ.get(
+            'SAMSUNG_TV_ART_PROGRAM_DATA_PATH', '/data/uploaded_files.json',
+        )
         self.uploaded_files = {}
         self.fav = set()
         self.api_version = 0
