@@ -476,22 +476,7 @@ class monitor_and_display(MQTTIntegrationMixin):
             self.log.info('TV is off, exiting')
         else:
             self.log.info('Start Monitoring')
-            # Do-and-forget: Bing Daily Wallpaper only ever changes once a day, and
-            # a rotation-mode selection needs a live socket to discover/rotate art
-            # anyway. If daily mode already has today's image uploaded and active,
-            # opening the Art WebSocket here would only re-verify state we already
-            # trust from the persisted cache — skip it (a manual change made via
-            # the TV remote is intentionally left alone, not overridden).
-            if self.tv is not None and self.bing_daily.already_applied():
-                self.log.info(
-                    'Bing Daily Wallpaper already applied for today; skipping '
-                    'startup Art WebSocket connect (do-and-forget)'
-                )
-                try:
-                    self._tv_powered_on = await self.tv.is_powered_on()
-                except Exception as e:
-                    self.log.debug('Startup power probe failed: %s', e)
-            elif self.tv is not None:
+            if self.tv is not None:
                 try:
                     # Use a longer timeout when no token exists (first-time pairing) so the
                     # user has time to see and accept the pairing prompt on the TV.
@@ -1454,7 +1439,6 @@ class monitor_and_display(MQTTIntegrationMixin):
                 'the Art channel recovers'
             )
 
-
     async def initialize(self):
         '''
         initializes program
@@ -1463,44 +1447,21 @@ class monitor_and_display(MQTTIntegrationMixin):
         this matching is not really needed if uploaded_files (loaded from file) is accurate,
         and can be skipped by setting sync (-s) to False
         '''
-        already_applied = self.bing_daily.already_applied()
-        if already_applied:
-            # Do-and-forget: get_api_version()/get_current_artwork()/
-            # safe_in_artmode() call the underlying TV client directly rather
-            # than going through a SAFE MODE tv_session(), so — unlike the
-            # session gated below — the client auto-opens its own WebSocket
-            # the moment any of them run. Skip them too, and derive "now
-            # showing" straight from the cache entry we already trust instead
-            # of a live query.
-            self.log.info(
-                'Bing Daily Wallpaper already applied for today; skipping '
-                'startup Art queries (do-and-forget)'
-            )
-            today_path = self.slideshow_override[0]
-            self.current_content_id = self.uploaded_files.get(today_path, {}).get('content_id')
-            self.log.info('Current artwork is: {} (from cache)'.format(self.current_content_id))
-            # Do NOT publish here: art mode/power state is still unknown at
-            # this point (we skipped safe_in_artmode() on purpose), and
-            # force-publishing now would overwrite the last known-good
-            # retained MQTT state with "unknown" for no reason. Leave the
-            # prior state as-is; the periodic status loop will confirm and
-            # republish the real state shortly on its own schedule.
-        else:
-            await self.get_api_version()
-            self.current_content_id = await self.get_current_artwork()
-            self.log.info('Current artwork is: {}'.format(self.current_content_id))
-            # If art mode hasn't been confirmed True yet, do one more check before
-            # publishing to avoid a transient false state immediately after connection.
-            if self._in_art_mode is not True and self.tv is not None:
-                try:
-                    await asyncio.sleep(1)
-                    await self.safe_in_artmode()
-                except Exception:
-                    pass
+        await self.get_api_version()
+        self.current_content_id = await self.get_current_artwork()
+        self.log.info('Current artwork is: {}'.format(self.current_content_id))
+        # If art mode hasn't been confirmed True yet, do one more check before
+        # publishing to avoid a transient false state immediately after connection.
+        if self._in_art_mode is not True and self.tv is not None:
             try:
-                await self._publish_current_artwork_state(force=True)
+                await asyncio.sleep(1)
+                await self.safe_in_artmode()
             except Exception:
                 pass
+        try:
+            await self._publish_current_artwork_state(force=True)
+        except Exception:
+            pass
         # Fallback selection: if nothing selected via MQTT, restore cached selection
         # or auto-select all available collections.
         try:
@@ -1539,36 +1500,24 @@ class monitor_and_display(MQTTIntegrationMixin):
             pass
         self.load_program_data()
         self.log.info('files in directory: {}: {}'.format(self.folder, self.get_folder_files()))
-        if already_applied:
-            # Do-and-forget: today's Bing image is already uploaded and active
-            # per the persisted cache, so there is nothing to reconcile. Skip
-            # opening the startup Art session (and the PIL thumbnail sync it
-            # would trigger) entirely, rather than opening a socket purely to
-            # re-confirm state we already trust.
-            self._tv_init_pending = False
-        else:
-            async with self.tv_session('startup', require_artmode=False):
-                await self._initialize_tv_state()
+        async with self.tv_session('startup', require_artmode=False):
+            await self._initialize_tv_state()
 
-                # Display art immediately after init only if TV is already in art mode.
-                # If not, the main loop will pick it up when art mode is detected naturally.
-                if len(self.get_content_ids()) > 0:
-                    if await self.safe_in_artmode():
-                        self.log.info('Content available after init and TV is in art mode, displaying first artwork')
-                        await self.change_art()
-                        self.start = time.time()
-                        self.write_program_data()
-                    else:
-                        self.log.info('Content available after init but TV is not in art mode; waiting for art mode')
-        # Initialization complete — clear startup lock and let UI know it's safe
-        self._startup_in_progress = False
-        self._publish_slideshow_state()
-        if not already_applied:
-            # Force-publish current artwork state so UIs clear any stale
-            # in_art_mode=false retained from a previous session. Skipped for
-            # a do-and-forget startup: art mode/power are still unverified
-            # here, so publishing now would overwrite good retained state
-            # with "unknown" for no reason.
+            # Display art immediately after init only if TV is already in art mode.
+            # If not, the main loop will pick it up when art mode is detected naturally.
+            if len(self.get_content_ids()) > 0:
+                if await self.safe_in_artmode():
+                    self.log.info('Content available after init and TV is in art mode, displaying first artwork')
+                    await self.change_art()
+                    self.start = time.time()
+                    self.write_program_data()
+                else:
+                    self.log.info('Content available after init but TV is not in art mode; waiting for art mode')
+            # Initialization complete — clear startup lock and let UI know it's safe
+            self._startup_in_progress = False
+            self._publish_slideshow_state()
+            # Force-publish current artwork state so UIs clear any stale in_art_mode=false
+            # retained from a previous session.
             try:
                 await self._publish_current_artwork_state(force=True)
             except Exception:
@@ -2713,12 +2662,7 @@ class monitor_and_display(MQTTIntegrationMixin):
         initialize, check directory for changed files and update
         '''
         await self.initialize()
-        # Do-and-forget: don't force an immediate art-mode/power probe right
-        # after a startup that already skipped the Art session entirely —
-        # that would just reopen the socket we deliberately avoided. The
-        # periodic status loop still probes on its own schedule once the
-        # backoff/idle timeout elapses.
-        self._status_check_needed = not self.bing_daily.already_applied()
+        self._status_check_needed = True
         probe_task = None
         if self.art_status_probe_seconds > 0 and not self.safe_mode:
             # In SAFE MODE there is no persistent socket to prove alive, and
