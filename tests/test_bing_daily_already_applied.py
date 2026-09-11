@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from loop.uploader import monitor_and_display
+from loop.BingDailyWallpaperManager import BingDailyWallpaperManager
 
 
 class BingDailyAlreadyAppliedTests(unittest.TestCase):
@@ -11,48 +11,51 @@ class BingDailyAlreadyAppliedTests(unittest.TestCase):
     need a live socket to discover/rotate art, so this must stay scoped to
     daily mode only."""
 
-    def make_host(self, is_daily_mode=True, pending=False, override=None, requires_upload=None):
-        host = monitor_and_display.__new__(monitor_and_display)
-        host.bing_daily = mock.Mock()
-        host.bing_daily.is_daily_mode.return_value = is_daily_mode
+    def make_manager(self, is_daily_mode=True, pending=False, override=None, requires_upload=None):
+        host = mock.Mock()
+        host.log = mock.Mock()
+        host.media_root = '/media'
+        manager = BingDailyWallpaperManager.__new__(BingDailyWallpaperManager)
+        manager.host = host
+        manager.is_daily_mode = mock.Mock(return_value=is_daily_mode)
         host.slideshow_override_pending = pending
         host.slideshow_override = override if override is not None else ['Bing_DailyWallpaper/today.jpg']
         host._slideshow_paths_requiring_upload = mock.Mock(
             return_value=requires_upload if requires_upload is not None else [],
         )
-        return host
+        return manager
 
     def test_true_when_daily_mode_applied_and_nothing_to_upload(self):
-        host = self.make_host()
+        manager = self.make_manager()
 
-        self.assertTrue(host._bing_daily_already_applied())
+        self.assertTrue(manager.already_applied())
 
     def test_false_when_not_daily_mode(self):
-        host = self.make_host(is_daily_mode=False)
+        manager = self.make_manager(is_daily_mode=False)
 
-        self.assertFalse(host._bing_daily_already_applied())
-        host._slideshow_paths_requiring_upload.assert_not_called()
+        self.assertFalse(manager.already_applied())
+        manager.host._slideshow_paths_requiring_upload.assert_not_called()
 
     def test_false_when_override_pending(self):
-        host = self.make_host(pending=True)
+        manager = self.make_manager(pending=True)
 
-        self.assertFalse(host._bing_daily_already_applied())
+        self.assertFalse(manager.already_applied())
 
     def test_false_when_no_override(self):
-        host = self.make_host(override=[])
+        manager = self.make_manager(override=[])
 
-        self.assertFalse(host._bing_daily_already_applied())
+        self.assertFalse(manager.already_applied())
 
     def test_false_when_upload_still_required(self):
-        host = self.make_host(requires_upload=['Bing_DailyWallpaper/today.jpg'])
+        manager = self.make_manager(requires_upload=['Bing_DailyWallpaper/today.jpg'])
 
-        self.assertFalse(host._bing_daily_already_applied())
+        self.assertFalse(manager.already_applied())
 
     def test_false_on_unexpected_error(self):
-        host = self.make_host()
-        host.bing_daily.is_daily_mode.side_effect = RuntimeError('boom')
+        manager = self.make_manager()
+        manager.is_daily_mode.side_effect = RuntimeError('boom')
 
-        self.assertFalse(host._bing_daily_already_applied())
+        self.assertFalse(manager.already_applied())
 
 
 if __name__ == '__main__':

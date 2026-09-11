@@ -27,7 +27,8 @@ class InitializeSkipsStartupSessionTests(unittest.IsolatedAsyncioTestCase):
         host.load_program_data = mock.Mock()
         host.get_folder_files = mock.Mock(return_value=[])
         host.folder = '/media/Bing_DailyWallpaper'
-        host._bing_daily_already_applied = mock.Mock(return_value=already_applied)
+        host.bing_daily = mock.Mock()
+        host.bing_daily.already_applied.return_value = already_applied
         host._initialize_tv_state = mock.AsyncMock()
         host.get_content_ids = mock.Mock(return_value=[])
         host.tv_session = mock.Mock(side_effect=RuntimeError('tv_session must not be entered'))

@@ -482,7 +482,7 @@ class monitor_and_display(MQTTIntegrationMixin):
             # opening the Art WebSocket here would only re-verify state we already
             # trust from the persisted cache — skip it (a manual change made via
             # the TV remote is intentionally left alone, not overridden).
-            if self.tv is not None and self._bing_daily_already_applied():
+            if self.tv is not None and self.bing_daily.already_applied():
                 self.log.info(
                     'Bing Daily Wallpaper already applied for today; skipping '
                     'startup Art WebSocket connect (do-and-forget)'
@@ -1454,25 +1454,6 @@ class monitor_and_display(MQTTIntegrationMixin):
                 'the Art channel recovers'
             )
 
-    def _bing_daily_already_applied(self):
-        """True when Bing Daily Wallpaper mode is selected and today's image is
-        already uploaded and active on the TV — there is nothing to reconcile.
-
-        Rotation-mode collections need a live socket to discover/rotate art, so
-        this only ever short-circuits the once-a-day Bing selection. The check
-        is purely local (persisted cache + file signatures), so it is safe to
-        call before any TV connection exists.
-        """
-        try:
-            if not self.bing_daily.is_daily_mode():
-                return False
-            if self.slideshow_override_pending or not self.slideshow_override:
-                return False
-            return not self._slideshow_paths_requiring_upload(
-                list(self.slideshow_override)
-            )
-        except Exception:
-            return False
 
     async def initialize(self):
         '''
@@ -1535,7 +1516,7 @@ class monitor_and_display(MQTTIntegrationMixin):
             pass
         self.load_program_data()
         self.log.info('files in directory: {}: {}'.format(self.folder, self.get_folder_files()))
-        if self._bing_daily_already_applied():
+        if self.bing_daily.already_applied():
             # Do-and-forget: today's Bing image is already uploaded and active
             # per the persisted cache, so there is nothing to reconcile. Skip
             # opening the startup Art session (and the PIL thumbnail sync it

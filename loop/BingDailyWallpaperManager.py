@@ -118,6 +118,29 @@ class BingDailyWallpaperManager:
             and all(self._is_bing_path(path) for path in override)
         )
 
+    def already_applied(self):
+        """True when today's Bing image is already uploaded and active on the
+        TV — there is nothing to reconcile.
+
+        Do-and-forget: Bing Daily Wallpaper only ever changes once a day, so a
+        caller can use this to skip opening an Art WebSocket purely to
+        re-verify state already known from the persisted cache. Rotation-mode
+        collections need a live socket to discover/rotate art on every start,
+        so this only ever short-circuits the once-a-day Bing selection. The
+        check is purely local (persisted cache + file signatures), so it is
+        safe to call before any TV connection exists.
+        """
+        try:
+            if not self.is_daily_mode():
+                return False
+            if self.host.slideshow_override_pending or not self.host.slideshow_override:
+                return False
+            return not self.host._slideshow_paths_requiring_upload(
+                list(self.host.slideshow_override)
+            )
+        except Exception:
+            return False
+
     def register_cached_metadata(self):
         state = self._load_cache()
         if state:
