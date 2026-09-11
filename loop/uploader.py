@@ -1463,21 +1463,42 @@ class monitor_and_display(MQTTIntegrationMixin):
         this matching is not really needed if uploaded_files (loaded from file) is accurate,
         and can be skipped by setting sync (-s) to False
         '''
-        await self.get_api_version()
-        self.current_content_id = await self.get_current_artwork()
-        self.log.info('Current artwork is: {}'.format(self.current_content_id))
-        # If art mode hasn't been confirmed True yet, do one more check before
-        # publishing to avoid a transient false state immediately after connection.
-        if self._in_art_mode is not True and self.tv is not None:
+        already_applied = self.bing_daily.already_applied()
+        if already_applied:
+            # Do-and-forget: get_api_version()/get_current_artwork()/
+            # safe_in_artmode() call the underlying TV client directly rather
+            # than going through a SAFE MODE tv_session(), so — unlike the
+            # session gated below — the client auto-opens its own WebSocket
+            # the moment any of them run. Skip them too, and derive "now
+            # showing" straight from the cache entry we already trust instead
+            # of a live query.
+            self.log.info(
+                'Bing Daily Wallpaper already applied for today; skipping '
+                'startup Art queries (do-and-forget)'
+            )
+            today_path = self.slideshow_override[0]
+            self.current_content_id = self.uploaded_files.get(today_path, {}).get('content_id')
+            self.log.info('Current artwork is: {} (from cache)'.format(self.current_content_id))
             try:
-                await asyncio.sleep(1)
-                await self.safe_in_artmode()
+                await self._publish_current_artwork_state(force=True, skip_live_poll=True)
             except Exception:
                 pass
-        try:
-            await self._publish_current_artwork_state(force=True)
-        except Exception:
-            pass
+        else:
+            await self.get_api_version()
+            self.current_content_id = await self.get_current_artwork()
+            self.log.info('Current artwork is: {}'.format(self.current_content_id))
+            # If art mode hasn't been confirmed True yet, do one more check before
+            # publishing to avoid a transient false state immediately after connection.
+            if self._in_art_mode is not True and self.tv is not None:
+                try:
+                    await asyncio.sleep(1)
+                    await self.safe_in_artmode()
+                except Exception:
+                    pass
+            try:
+                await self._publish_current_artwork_state(force=True)
+            except Exception:
+                pass
         # Fallback selection: if nothing selected via MQTT, restore cached selection
         # or auto-select all available collections.
         try:
@@ -1516,16 +1537,12 @@ class monitor_and_display(MQTTIntegrationMixin):
             pass
         self.load_program_data()
         self.log.info('files in directory: {}: {}'.format(self.folder, self.get_folder_files()))
-        if self.bing_daily.already_applied():
+        if already_applied:
             # Do-and-forget: today's Bing image is already uploaded and active
             # per the persisted cache, so there is nothing to reconcile. Skip
             # opening the startup Art session (and the PIL thumbnail sync it
             # would trigger) entirely, rather than opening a socket purely to
             # re-confirm state we already trust.
-            self.log.info(
-                'Bing Daily Wallpaper already applied for today; skipping '
-                'startup Art session (do-and-forget)'
-            )
             self._tv_init_pending = False
         else:
             async with self.tv_session('startup', require_artmode=False):
@@ -1547,7 +1564,7 @@ class monitor_and_display(MQTTIntegrationMixin):
         # Force-publish current artwork state so UIs clear any stale in_art_mode=false
         # retained from a previous session.
         try:
-            await self._publish_current_artwork_state(force=True)
+            await self._publish_current_artwork_state(force=True, skip_live_poll=already_applied)
         except Exception:
             pass
         
@@ -2690,7 +2707,12 @@ class monitor_and_display(MQTTIntegrationMixin):
         initialize, check directory for changed files and update
         '''
         await self.initialize()
-        self._status_check_needed = True
+        # Do-and-forget: don't force an immediate art-mode/power probe right
+        # after a startup that already skipped the Art session entirely —
+        # that would just reopen the socket we deliberately avoided. The
+        # periodic status loop still probes on its own schedule once the
+        # backoff/idle timeout elapses.
+        self._status_check_needed = not self.bing_daily.already_applied()
         probe_task = None
         if self.art_status_probe_seconds > 0 and not self.safe_mode:
             # In SAFE MODE there is no persistent socket to prove alive, and
@@ -2829,25 +2851,38 @@ class monitor_and_display(MQTTIntegrationMixin):
                 except asyncio.TimeoutError:
                     pass
 
-    async def _publish_current_artwork_state(self, force=False, state_locked=False):
+    async def _publish_current_artwork_state(self, force=False, state_locked=False, skip_live_poll=False):
         """Poll current TV artwork and publish MQTT state/attributes.
         Uses uploaded_files mapping to derive filename when possible.
+
+        skip_live_poll=True trusts self.current_content_id as already set
+        (e.g. derived from the persisted cache) instead of calling
+        get_current_artwork(), which — like get_api_version()/
+        safe_in_artmode() — talks to the TV client directly and would
+        auto-open a WebSocket outside of any SAFE MODE session.
         """
-        if not state_locked:
-            await self._tv_state_lock.acquire()
-        try:
+        if skip_live_poll:
             if self._refresh_in_progress:
                 return
             if not self.mqtt_enabled or not self._mqtt:
                 return
-            try:
-                cid = await self.get_current_artwork()
-            except Exception:
-                self._status_check_needed = True
-                return
-        finally:
+            cid = self.current_content_id
+        else:
             if not state_locked:
-                self._tv_state_lock.release()
+                await self._tv_state_lock.acquire()
+            try:
+                if self._refresh_in_progress:
+                    return
+                if not self.mqtt_enabled or not self._mqtt:
+                    return
+                try:
+                    cid = await self.get_current_artwork()
+                except Exception:
+                    self._status_check_needed = True
+                    return
+            finally:
+                if not state_locked:
+                    self._tv_state_lock.release()
         # If nothing has changed and not forced, skip
         if cid == self.current_content_id and not force:
             # Still ensure attributes are up to date periodically

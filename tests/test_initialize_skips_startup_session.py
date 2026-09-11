@@ -17,6 +17,10 @@ class InitializeSkipsStartupSessionTests(unittest.IsolatedAsyncioTestCase):
         host._in_art_mode = None
         host.selected_collections = ['Bing_DailyWallpaper']
         host.current_content_id = None
+        host.slideshow_override = ['Bing_DailyWallpaper/today.jpg']
+        host.uploaded_files = {
+            'Bing_DailyWallpaper/today.jpg': {'content_id': 'MY_F0273'},
+        }
         host._tv_init_pending = True
         host._startup_in_progress = True
         host.get_api_version = mock.AsyncMock()
@@ -41,6 +45,10 @@ class InitializeSkipsStartupSessionTests(unittest.IsolatedAsyncioTestCase):
 
         host.tv_session.assert_not_called()
         host._initialize_tv_state.assert_not_called()
+        host.get_api_version.assert_not_called()
+        host.get_current_artwork.assert_not_called()
+        host.safe_in_artmode.assert_not_called()
+        self.assertEqual(host.current_content_id, 'MY_F0273')
         self.assertFalse(host._tv_init_pending)
         self.assertFalse(host._startup_in_progress)
         host._publish_slideshow_state.assert_called_once()
