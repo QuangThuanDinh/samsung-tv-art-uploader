@@ -1479,10 +1479,12 @@ class monitor_and_display(MQTTIntegrationMixin):
             today_path = self.slideshow_override[0]
             self.current_content_id = self.uploaded_files.get(today_path, {}).get('content_id')
             self.log.info('Current artwork is: {} (from cache)'.format(self.current_content_id))
-            try:
-                await self._publish_current_artwork_state(force=True, skip_live_poll=True)
-            except Exception:
-                pass
+            # Do NOT publish here: art mode/power state is still unknown at
+            # this point (we skipped safe_in_artmode() on purpose), and
+            # force-publishing now would overwrite the last known-good
+            # retained MQTT state with "unknown" for no reason. Leave the
+            # prior state as-is; the periodic status loop will confirm and
+            # republish the real state shortly on its own schedule.
         else:
             await self.get_api_version()
             self.current_content_id = await self.get_current_artwork()
@@ -1561,12 +1563,16 @@ class monitor_and_display(MQTTIntegrationMixin):
         # Initialization complete — clear startup lock and let UI know it's safe
         self._startup_in_progress = False
         self._publish_slideshow_state()
-        # Force-publish current artwork state so UIs clear any stale in_art_mode=false
-        # retained from a previous session.
-        try:
-            await self._publish_current_artwork_state(force=True, skip_live_poll=already_applied)
-        except Exception:
-            pass
+        if not already_applied:
+            # Force-publish current artwork state so UIs clear any stale
+            # in_art_mode=false retained from a previous session. Skipped for
+            # a do-and-forget startup: art mode/power are still unverified
+            # here, so publishing now would overwrite good retained state
+            # with "unknown" for no reason.
+            try:
+                await self._publish_current_artwork_state(force=True)
+            except Exception:
+                pass
         
     async def get_tv_content(self, category='MY-C0002'):
         '''
@@ -2851,38 +2857,25 @@ class monitor_and_display(MQTTIntegrationMixin):
                 except asyncio.TimeoutError:
                     pass
 
-    async def _publish_current_artwork_state(self, force=False, state_locked=False, skip_live_poll=False):
+    async def _publish_current_artwork_state(self, force=False, state_locked=False):
         """Poll current TV artwork and publish MQTT state/attributes.
         Uses uploaded_files mapping to derive filename when possible.
-
-        skip_live_poll=True trusts self.current_content_id as already set
-        (e.g. derived from the persisted cache) instead of calling
-        get_current_artwork(), which — like get_api_version()/
-        safe_in_artmode() — talks to the TV client directly and would
-        auto-open a WebSocket outside of any SAFE MODE session.
         """
-        if skip_live_poll:
+        if not state_locked:
+            await self._tv_state_lock.acquire()
+        try:
             if self._refresh_in_progress:
                 return
             if not self.mqtt_enabled or not self._mqtt:
                 return
-            cid = self.current_content_id
-        else:
-            if not state_locked:
-                await self._tv_state_lock.acquire()
             try:
-                if self._refresh_in_progress:
-                    return
-                if not self.mqtt_enabled or not self._mqtt:
-                    return
-                try:
-                    cid = await self.get_current_artwork()
-                except Exception:
-                    self._status_check_needed = True
-                    return
-            finally:
-                if not state_locked:
-                    self._tv_state_lock.release()
+                cid = await self.get_current_artwork()
+            except Exception:
+                self._status_check_needed = True
+                return
+        finally:
+            if not state_locked:
+                self._tv_state_lock.release()
         # If nothing has changed and not forced, skip
         if cid == self.current_content_id and not force:
             # Still ensure attributes are up to date periodically

@@ -48,6 +48,10 @@ class InitializeSkipsStartupSessionTests(unittest.IsolatedAsyncioTestCase):
         host.get_api_version.assert_not_called()
         host.get_current_artwork.assert_not_called()
         host.safe_in_artmode.assert_not_called()
+        # Art mode/power are still unverified at this point, so publishing
+        # would overwrite good retained MQTT state with "unknown" for no
+        # reason — leave it untouched until the periodic loop confirms it.
+        host._publish_current_artwork_state.assert_not_called()
         self.assertEqual(host.current_content_id, 'MY_F0273')
         self.assertFalse(host._tv_init_pending)
         self.assertFalse(host._startup_in_progress)
@@ -65,6 +69,7 @@ class InitializeSkipsStartupSessionTests(unittest.IsolatedAsyncioTestCase):
 
         host.tv_session.assert_called_once_with('startup', require_artmode=False)
         host._initialize_tv_state.assert_called_once()
+        host._publish_current_artwork_state.assert_called()
 
 
 if __name__ == '__main__':

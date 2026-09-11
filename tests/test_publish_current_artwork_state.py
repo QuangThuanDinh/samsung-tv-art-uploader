@@ -47,21 +47,6 @@ class PublishCurrentArtworkStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(file_attr, 'flat.jpg')
         self.assertEqual(display, 'flat')
 
-    async def test_skip_live_poll_does_not_call_get_current_artwork(self):
-        """skip_live_poll must trust self.current_content_id (e.g. derived
-        from cache during a do-and-forget startup) instead of calling
-        get_current_artwork(), which talks to the TV client directly and
-        would auto-open a WebSocket outside of any SAFE MODE session."""
-        host = self.make_host('Bing_DailyWallpaper/OHR.Olvera_UHD.museum-label.jpg')
-        host.current_content_id = 'cid-1'
-
-        await host._publish_current_artwork_state(force=True, skip_live_poll=True)
-
-        host.get_current_artwork.assert_not_called()
-        host._publish_mqtt_state.assert_called_once()
-        display, file_attr, collection = host._publish_mqtt_state.call_args[0]
-        self.assertEqual(file_attr, 'OHR.Olvera_UHD.museum-label.jpg')
-
 
 if __name__ == '__main__':
     unittest.main()
