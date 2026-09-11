@@ -2823,8 +2823,15 @@ class monitor_and_display(MQTTIntegrationMixin):
         filename = self.get_filename_for_content_id(self.current_content_id) if self.current_content_id else None
         display = None
         collection = None
+        base_name = None
         if filename:
-            display = os.path.splitext(filename)[0]
+            # filename is the uploaded_files cache key, which is the full
+            # media_root-relative path (e.g. "Bing_DailyWallpaper/foo.jpg") for
+            # subfolder collections. Publishing that raw value as "file" made
+            # the web UI build a doubled-up image URL (folder + full rel path),
+            # so only the basename is ever published as "file".
+            base_name = os.path.basename(filename)
+            display = os.path.splitext(base_name)[0]
             # Try to infer collection from cached metadata
             try:
                 rec = self.uploaded_files.get(filename, {})
@@ -2842,7 +2849,7 @@ class monitor_and_display(MQTTIntegrationMixin):
             display = 'Unknown'
         try:
             self._publish_mqtt_discovery()
-            self._publish_mqtt_state(display, filename or '', collection)
+            self._publish_mqtt_state(display, base_name or '', collection)
         except Exception:
             pass
 
